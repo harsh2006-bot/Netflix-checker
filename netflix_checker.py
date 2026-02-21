@@ -406,7 +406,7 @@ def main():
                         for filename in z.namelist():
                             if filename.endswith('.txt'):
                                 with z.open(filename) as f:
-                                    cookies.extend(f.read().decode('utf-8', errors='ignore').splitlines()
+                                    cookies.extend(f.read().decode('utf-8', errors='ignore').splitlines())
             else:
                 cookies = message.text.splitlines()
             

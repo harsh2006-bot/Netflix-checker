@@ -30,9 +30,9 @@ BOT_TOKEN = "8477278414:AAHAxLMV9lgqvSCjnj_AIDnH6pxm82Q55So"
 ADMIN_ID = 6176299339
 CHANNELS = ["@F88UFNETFLIX", "@F88UF9844"]
 USERS_FILE = "users.txt"
-SCREENSHOT_SEMAPHORE = threading.Semaphore(10) 
+SCREENSHOT_SEMAPHORE = threading.Semaphore(2) 
 # Global Executor to prevent server crash under heavy load (100+ users)
-GLOBAL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=30)
+GLOBAL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=15)
 
 app = Flask(__name__)
 
@@ -610,7 +610,7 @@ def main():
             is_bulk = should_send_file
 
             # Bulk Access Check
-            if is_bulk:
+            if is_bulk and uid != ADMIN_ID:
                 expiry = bulk_access.get(uid, 0)
                 if time.time() > expiry:
                     markup = types.InlineKeyboardMarkup()

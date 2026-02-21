@@ -663,13 +663,34 @@ def main():
                 
                 # Animation Thread
                 def animate_check():
-                    frames = ["🌑", "🌒", "🌓", "🌔", "🌕", "🌖", "🌗", "🌘"]
-                    idx = 0
+                    # Unique Animation Sequence
+                    animations = [
+                        "🌑 🌒 🌓 🌔 🌕 🌖 🌗 🌘",
+                        "⣾ ⣽ ⣻ ⢿ ⡿ ⣟ ⣯ ⣷",
+                        "⚡ 🔌 💡 🔋 🔌 ⚡",
+                        "💾 💿 📀 📼 📷 📺"
+                    ]
+                    messages = [
+                        "🚀 **Connecting to Netflix...**",
+                        "🔑 **Decrypting Session Token...**",
+                        "🌍 **Bypassing Geo-Block...**",
+                        "🔍 **Scanning Account Data...**",
+                        "💎 **Checking Subscription...**",
+                        "💳 **Verifying Payment Info...**"
+                    ]
+                    i = 0
                     while getattr(status_msg, "keep_animating", True):
                         try:
-                            bot.edit_message_text(f"{frames[idx]} **Checking Cookie...**\n_Please wait..._", message.chat.id, status_msg.message_id, parse_mode='Markdown')
-                            idx = (idx + 1) % len(frames)
-                            time.sleep(0.5)
+                            msg_idx = (i // 3) % len(messages)
+                            anim_set_idx = (i // 10) % len(animations)
+                            anim_frames = animations[anim_set_idx].split()
+                            frame = anim_frames[i % len(anim_frames)]
+                            percent = min((i * 5) % 100, 99)
+                            bar = "█" * (percent // 10) + "░" * (10 - (percent // 10))
+                            
+                            bot.edit_message_text(f"{frame} {messages[msg_idx]}\n`[{bar}] {percent}%`", message.chat.id, status_msg.message_id, parse_mode='Markdown')
+                            i += 1
+                            time.sleep(0.7)
                         except: break
                 
                 status_msg.keep_animating = True

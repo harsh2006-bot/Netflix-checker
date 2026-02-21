@@ -8,4 +8,4 @@ RUN playwright install chromium
 
 COPY . .
 
-CMD ["python", "netflix_checker.py"]
+CMD ["python3", "netflix_checker.py"]

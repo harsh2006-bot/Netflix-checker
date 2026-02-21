@@ -25,13 +25,14 @@ log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 
 user_modes = {}
+bulk_access = {} # {user_id: expiry_timestamp}
 BOT_TOKEN = "8477278414:AAHAxLMV9lgqvSCjnj_AIDnH6pxm82Q55So"
 ADMIN_ID = 6176299339
 CHANNELS = ["@F88UFNETFLIX", "@F88UF9844"]
 USERS_FILE = "users.txt"
 SCREENSHOT_SEMAPHORE = threading.Semaphore(10) 
 # Global Executor to prevent server crash under heavy load (100+ users)
-GLOBAL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=100)
+GLOBAL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=30)
 
 app = Flask(__name__)
 
@@ -462,6 +463,39 @@ def main():
             user_modes[message.chat.id] = {'stop': True}
         bot.reply_to(message, "**🛑 Scanning Stopped.**", parse_mode='Markdown')
 
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('req_bulk_'))
+    def handle_bulk_request(call):
+        requester_id = int(call.data.split('_')[2])
+        bot.answer_callback_query(call.id, "✅ Request Sent to Admin!")
+        
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("✅ Approve (1H)", callback_data=f"app_bulk_{requester_id}"),
+                   types.InlineKeyboardButton("❌ Deny", callback_data=f"deny_bulk_{requester_id}"))
+        
+        bot.send_message(ADMIN_ID, f"🔔 **Bulk Access Request**\nUser ID: `{requester_id}`\nName: {call.from_user.first_name}", reply_markup=markup, parse_mode='Markdown')
+        bot.edit_message_text("✅ **Request Sent!**\nWait for Admin approval.", call.message.chat.id, call.message.message_id, parse_mode='Markdown')
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('app_bulk_'))
+    def approve_bulk(call):
+        if call.from_user.id != ADMIN_ID: return
+        requester_id = int(call.data.split('_')[2])
+        bulk_access[requester_id] = time.time() + 3600 # 1 Hour Validity
+        
+        bot.edit_message_text(f"✅ **Access Granted to {requester_id} for 1 Hour.**", call.message.chat.id, call.message.message_id, parse_mode='Markdown')
+        try:
+            bot.send_message(requester_id, "✅ **Bulk Access Enabled!**\n\nYou can now upload files for **1 Hour**.", parse_mode='Markdown')
+        except: pass
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('deny_bulk_'))
+    def deny_bulk(call):
+        if call.from_user.id != ADMIN_ID: return
+        requester_id = int(call.data.split('_')[2])
+        
+        bot.edit_message_text(f"❌ **Request Denied for {requester_id}.**", call.message.chat.id, call.message.message_id, parse_mode='Markdown')
+        try:
+            bot.send_message(requester_id, "❌ **Bulk Access Request Denied.**\nTry again later.", parse_mode='Markdown')
+        except: pass
+
     @bot.message_handler(func=lambda m: m.text == "📩 Send Here (DM)")
     def mode_dm(message):
         save_user(message.chat.id)
@@ -572,11 +606,49 @@ def main():
             
             if not valid_cookies: return bot.reply_to(message, "❌ **No Valid Cookies Found!**", parse_mode='Markdown')
 
-            bot.reply_to(message, f"🚀 **Checking {len(valid_cookies)} Cookies...**\n_Task started in background._", parse_mode='Markdown')
-            
             should_send_file = is_file_input or len(valid_cookies) > 1
+            is_bulk = should_send_file
+
+            # Bulk Access Check
+            if is_bulk:
+                expiry = bulk_access.get(uid, 0)
+                if time.time() > expiry:
+                    markup = types.InlineKeyboardMarkup()
+                    markup.add(types.InlineKeyboardButton("🔓 Request Bulk Access", callback_data=f"req_bulk_{uid}"))
+                    bot.reply_to(message, "⚠️ **Bulk Check Not Enabled!**\n\nBulk checking is restricted to prevent server load.\n\n👇 **Click below to request access (Valid for 1 Hour).**", reply_markup=markup, parse_mode='Markdown')
+                    return
+
+            # Single Cookie Animation Logic
+            if not is_bulk:
+                status_msg = bot.reply_to(message, "⏳ **Initializing...**", parse_mode='Markdown')
+                
+                # Animation Thread
+                def animate_check():
+                    frames = ["🌑", "🌒", "🌓", "🌔", "🌕", "🌖", "🌗", "🌘"]
+                    idx = 0
+                    while getattr(status_msg, "keep_animating", True):
+                        try:
+                            bot.edit_message_text(f"{frames[idx]} **Checking Cookie...**\n_Please wait..._", message.chat.id, status_msg.message_id, parse_mode='Markdown')
+                            idx = (idx + 1) % len(frames)
+                            time.sleep(0.5)
+                        except: break
+                
+                status_msg.keep_animating = True
+                threading.Thread(target=animate_check, daemon=True).start()
+                
+                start_t = time.time()
+                res = check_cookie(valid_cookies[0])
+                status_msg.keep_animating = False
+                
+                try: bot.delete_message(message.chat.id, status_msg.message_id)
+                except: pass
+                
+                if res["valid"]: send_hit(mode['target'], res, valid_cookies[0], round(time.time() - start_t, 2))
+                else: bot.reply_to(message, f"❌ **Invalid Cookie**\nReason: {res.get('msg', 'Unknown')}")
+                return
 
             def background_checker(cookies, chat_id, target, send_file):
+                bot.send_message(chat_id, f"🚀 **Bulk Check Started!**\nChecking {len(cookies)} Cookies...", parse_mode='Markdown')
                 valid_count = 0
                 hits_list = [] # Store hits for summary file
 

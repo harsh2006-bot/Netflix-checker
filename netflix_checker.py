@@ -286,15 +286,23 @@ def check_cookie(cookie_input):
                     with sync_playwright() as p:
                         browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--disable-extensions', '--mute-audio'])
                         ctx = browser.new_context(viewport={'width': 1280, 'height': 720})
-                        # Block heavy resources for speed
-                        ctx.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media", "font"] else route.continue_())
+                        # Block only media/fonts (Allow images to fix black screenshot)
+                        ctx.route("**/*", lambda route: route.abort() if route.request.resource_type in ["media", "font"] else route.continue_())
                         ctx.add_cookies([{'name': 'NetflixId', 'value': nid, 'domain': '.netflix.com', 'path': '/'}])
                         pg = ctx.new_page()
-                        pg.goto("https://www.netflix.com/browse", timeout=8000, wait_until='domcontentloaded')
+                        
+                        # Random Page for Screenshot
+                        pages = [
+                            "https://www.netflix.com/browse",
+                            "https://www.netflix.com/YourAccount",
+                            "https://www.netflix.com/browse/genre/83",
+                            "https://www.netflix.com/browse/genre/34399"
+                        ]
+                        pg.goto(random.choice(pages), timeout=10000, wait_until='domcontentloaded')
                         
                         # Fix Black Screenshot: Wait for content to render
                         try: 
-                            pg.wait_for_selector('.main-header', state='visible', timeout=3000)
+                            pg.wait_for_load_state('networkidle', timeout=3000)
                         except: 
                             pg.wait_for_timeout(2500)
                         

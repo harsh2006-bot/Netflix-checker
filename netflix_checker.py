@@ -1,3 +1,4 @@
+
 import requests
 import logging
 import time
@@ -259,16 +260,15 @@ def check_cookie(cookie_input):
 
         screenshot_bytes = None
         try:
-            if SCREENSHOT_SEMAPHORE.acquire(timeout=5): # Faster timeout so it doesn't block workers forever
+            if SCREENSHOT_SEMAPHORE.acquire(timeout=5): 
                 try:
                     with sync_playwright() as p:
                         browser = p.chromium.launch(headless=True)
                         context = browser.new_context(user_agent=HEADERS['User-Agent'], viewport={'width': 1280, 'height': 720})
                         context.add_cookies(playwright_cookies)
                         page = context.new_page()
-                        # Removed 3 second hardcoded sleep, and changed wait_until to 'load' for ultra-speed
                         page.goto("https://www.netflix.com/browse", timeout=15000, wait_until='load')
-                        screenshot_bytes = page.screenshot(type='jpeg', quality=50) # Lightweight fast screenshot
+                        screenshot_bytes = page.screenshot(type='jpeg', quality=50) 
                         browser.close()
                 finally:
                     SCREENSHOT_SEMAPHORE.release()
@@ -407,10 +407,10 @@ def main():
                 file_info = bot.get_file(message.document.file_id)
                 downloaded_file = bot.download_file(file_info.file_path)
                 
-                                if message.document.file_name.endswith('.zip'):
+                if message.document.file_name.endswith('.zip'):
                     with zipfile.ZipFile(io.BytesIO(downloaded_file)) as z:
                         for filename in z.namelist():
-                            if filename.endswith('.txt'):
+              if filename.endswith('.txt'):
                                 with z.open(filename) as f: cookies.extend(f.read().decode('utf-8', errors='ignore').splitlines())
                 else: cookies = downloaded_file.decode('utf-8', errors='ignore').splitlines()
             else: cookies = message.text.splitlines()
@@ -435,7 +435,6 @@ def main():
                     except: pass
                     return None
 
-                # INCREASED MAX WORKERS TO 60 FOR LIGHTNING FAST SPEED
                 with concurrent.futures.ThreadPoolExecutor(max_workers=60) as executor:
                     futures = [executor.submit(process_cookie, c) for c in cookies]
                     for future in concurrent.futures.as_completed(futures):

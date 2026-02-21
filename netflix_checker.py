@@ -213,7 +213,6 @@ def extract_deep_details(html):
 
     return details
 
-# --- UPDATED: THIS FUNCTION NOW USES YOUR NEW API ---
 def get_magic_link_api(netflix_id):
     try:
         if "NetflixId=" in netflix_id:
@@ -406,4 +405,4 @@ def main():
         try:
             count = 0
             if os.path.exists(USERS_FILE):
-                
+                with open(USERS_FILE, "r") as f: count = len(f.read().s

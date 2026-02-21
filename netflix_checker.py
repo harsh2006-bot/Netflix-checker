@@ -405,31 +405,39 @@ def main():
         bot.register_next_step_handler(msg, perform_broadcast)
 
     def perform_broadcast(message):
-        try:
-            if not os.path.exists(USERS_FILE): return bot.reply_to(message, "❌ No users found.")
-            with open(USERS_FILE, "r") as f: users = f.read().splitlines()
-            count = 0
-            for uid in users:
-                try:
-                    if message.content_type == 'text':
-                        bot.send_message(uid, message.text)
-                    elif message.content_type == 'photo':
-                        bot.send_photo(uid, message.photo[-1].file_id, caption=message.caption)
-                    elif message.content_type == 'document':
-                        bot.send_document(uid, message.document.file_id, caption=message.caption)
-                    elif message.content_type == 'video':
-                        bot.send_video(uid, message.video.file_id, caption=message.caption)
-                    elif message.content_type == 'audio':
-                        bot.send_audio(uid, message.audio.file_id, caption=message.caption)
-                    elif message.content_type == 'voice':
-                        bot.send_voice(uid, message.voice.file_id, caption=message.caption)
-                    count += 1
-                except: pass
-            bot.reply_to(message, f"✅ **Broadcast sent to {count} users.**")
-        except Exception as e: bot.reply_to(message, f"❌ Error: {e}")
+        def _broadcast():
+            try:
+                if not os.path.exists(USERS_FILE): 
+                    bot.reply_to(message, "❌ No users found.")
+                    return
+                with open(USERS_FILE, "r") as f: users = f.read().splitlines()
+                count = 0
+                for uid in users:
+                    try:
+                        if message.content_type == 'text':
+                            bot.send_message(uid, message.text)
+                        elif message.content_type == 'photo':
+                            bot.send_photo(uid, message.photo[-1].file_id, caption=message.caption)
+                        elif message.content_type == 'document':
+                            bot.send_document(uid, message.document.file_id, caption=message.caption)
+                        elif message.content_type == 'video':
+                            bot.send_video(uid, message.video.file_id, caption=message.caption)
+                        elif message.content_type == 'audio':
+                            bot.send_audio(uid, message.audio.file_id, caption=message.caption)
+                        elif message.content_type == 'voice':
+                            bot.send_voice(uid, message.voice.file_id, caption=message.caption)
+                        count += 1
+                        time.sleep(0.05)
+                    except: pass
+                bot.reply_to(message, f"✅ **Broadcast sent to {count} users.**")
+            except Exception as e: bot.reply_to(message, f"❌ Error: {e}")
+        
+        threading.Thread(target=_broadcast).start()
+        bot.reply_to(message, "🚀 **Broadcast started in background...**")
 
     @bot.message_handler(func=lambda m: m.text == "🛑 Stop System")
     def stop_sys(message):
+        save_user(message.chat.id)
         if message.chat.id in user_modes:
             user_modes[message.chat.id]['stop'] = True
         else:
@@ -438,11 +446,13 @@ def main():
 
     @bot.message_handler(func=lambda m: m.text == "📩 Send Here (DM)")
     def mode_dm(message):
+        save_user(message.chat.id)
         user_modes[message.chat.id] = {'target': message.chat.id, 'stop': False}
         bot.reply_to(message, "**✅ DM Mode Active.** Send file or text now.", parse_mode='Markdown')
 
     @bot.message_handler(func=lambda m: m.text == "📡 Send to Channel")
     def mode_ch(message):
+        save_user(message.chat.id)
         msg = bot.reply_to(message, "**📡 Enter Channel ID** (e.g., -100xxxx):", parse_mode='Markdown')
         bot.register_next_step_handler(msg, save_ch)
 
@@ -455,6 +465,7 @@ def main():
 
     @bot.message_handler(func=lambda m: m.text == "📺 TV Login")
     def tv_login_start(message):
+        save_user(message.chat.id)
         msg = bot.reply_to(message, "📺 **TV Login Mode**\n\n1️⃣ Please send your **Netflix Cookie** now.", parse_mode='Markdown')
         bot.register_next_step_handler(msg, tv_login_cookie)
 

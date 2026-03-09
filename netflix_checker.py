@@ -27,7 +27,7 @@ log.setLevel(logging.ERROR)
 user_modes = {}
 bulk_access = {} # {user_id: expiry_timestamp}
 user_daily_usage = {} # {user_id: {'date': 'YYYY-MM-DD', 'count': 0}}
-BOT_TOKEN = "8477278414:AAHAxLMV9lgqvSCjnj_AIDnH6pxm82Q55So"
+BOT_TOKEN = "8477278414:AAG09JSPwKCSdDSlRzMQ5Lr2MC8BbBMvvhc"
 ADMIN_ID = 6176299339
 CHANNELS = ["@F88UFNETFLIX", "@F88UF9844"]
 USERS_FILE = "users.txt"

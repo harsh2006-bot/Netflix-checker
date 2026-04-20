@@ -1,6 +1,0 @@
-requests
-pyTelegramBotAPI
-playwright
-flask
-colorama
-urllib3

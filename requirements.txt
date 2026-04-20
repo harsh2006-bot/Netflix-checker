@@ -1,0 +1,5 @@
+pyTelegramBotAPI==4.21.0
+requests==2.31.0
+flask==3.0.3
+colorama==0.4.6
+urllib3==1.26.18

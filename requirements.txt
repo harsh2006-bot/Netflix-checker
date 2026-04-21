@@ -4,3 +4,4 @@ flask==3.0.3
 colorama==0.4.6
 urllib3==1.26.18
 gunicorn==21.2.0
+playwright

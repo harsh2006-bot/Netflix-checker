@@ -3991,7 +3991,7 @@ def main():
     # Fix for Conflict error: skip pending updates
     while True:
         try:
-            bot.infinity_polling(timeout=90, long_polling_timeout=60, skip_pending=True)
+            bot.infinity_polling(timeout=20, long_polling_timeout=15, skip_pending=True)
         except Exception as e:
             print(f"⚠️ Polling Error: {e}")
             # If conflict (409), wait longer to allow other instance to close

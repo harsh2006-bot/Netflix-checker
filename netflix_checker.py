@@ -1380,7 +1380,7 @@ def check_cookie_fast(cookie_input, api_key=None):
         "screenshot": None
     }
 
-def check_cookie(cookie_input, get_screenshot=True):
+def check_cookie(cookie_input, get_screenshot=False):
     nid = parse_smart_cookie(cookie_input)
     if not nid: return {"valid": False, "msg": "Invalid Cookie Format"}
     # Normalize: always send clean NetflixId=value to API

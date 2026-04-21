@@ -4002,3 +4002,18 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+import threading, time, requests, os
+
+def self_ping():
+    url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not url:
+        url = "https://netflix-checker-t816.onrender.com"
+    while True:
+        try:
+            requests.get(url + "/health", timeout=10)
+        except:
+            pass
+        time.sleep(180)
+
+threading.Thread(target=self_ping, daemon=True).start()

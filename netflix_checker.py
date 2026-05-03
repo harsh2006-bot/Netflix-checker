@@ -212,7 +212,9 @@ USER_SINGLE_ONLY = True  # non-admin: only 1 cookie per check request
 import queue as _queue_module
 
 _API_QUEUE = _queue_module.Queue()           # FIFO queue of (event, result_holder)
-_API_RATE_INTERVAL = 1.2                      # seconds between API calls (relaxed for throughput)
+# NFToken.site strict limit: 1 request per 2 seconds per API key.
+# Use a slightly-above-limit interval to absolutely avoid RATE_LIMIT responses.
+_API_RATE_INTERVAL = 2.1                      # seconds between API calls (strict per-key limit)
 _api_queue_lock = threading.Lock()
 
 def _api_worker():
@@ -1456,10 +1458,9 @@ def check_cookie_fast(cookie_input, api_key=None):
     except Exception:
         pass
 
-    # Prefer iOS-generated links for PC/Mobile, but prefer API x_l3 for TV
-    # because it is the dedicated TV flow URL when available.
-    final_link1 = ios_link1 or (api_link  if str(api_link  or "").startswith("http") else None)
-    final_link2 = ios_link2 or (api_link2 if str(api_link2 or "").startswith("http") else None)
+    # Prefer API x_l1/x_l2/x_l3 (user-specified), fall back to iOS-generated links.
+    final_link1 = (api_link  if str(api_link  or "").startswith("http") else None) or ios_link1
+    final_link2 = (api_link2 if str(api_link2 or "").startswith("http") else None) or ios_link2
     final_link3 = (api_link3 if str(api_link3 or "").startswith("http") else None) or ios_link3
 
     return {
@@ -1514,9 +1515,9 @@ def check_cookie(cookie_input, get_screenshot=False):
     except Exception:
         pass
 
-    # Build final links for output
-    final_link1 = ios_link1 or (api_link  if str(api_link  or "").startswith("http") else None)
-    final_link2 = ios_link2 or (api_link2 if str(api_link2 or "").startswith("http") else None)
+    # Build final links for output — prefer API x_l1/x_l2/x_l3, fall back to iOS.
+    final_link1 = (api_link  if str(api_link  or "").startswith("http") else None) or ios_link1
+    final_link2 = (api_link2 if str(api_link2 or "").startswith("http") else None) or ios_link2
     final_link3 = (api_link3 if str(api_link3 or "").startswith("http") else None) or ios_link3
 
     # 3. Scrape deep account details (best-effort)
@@ -1955,7 +1956,7 @@ def main():
             kb.add("🔍 Free Check", "💎 Premium Check")
             kb.add("➕ Add Cookie", "👑 Manage Access")
             kb.add("📣 Broadcast", "👥 Users Stats")
-            kb.add("🗑 Manage DB")
+            kb.add("🗑 Manage DB", "🩺 DB Health")
             kb.add("🛑 Stop System")
         else:
             # Regular users
@@ -2147,19 +2148,35 @@ def main():
             if res.data:
                 rows = list(res.data)
                 random.shuffle(rows)
+                dead_ids_gc = []
+                dead_lock_gc = threading.Lock()
                 # Parallel validity check on up to 30 cookies — find first valid quickly
                 def _vc(row):
                     c = _db_row_cookie(row)
-                    if not c: return None
+                    if not c:
+                        with dead_lock_gc: dead_ids_gc.append(row.get('id'))
+                        return None
                     nid_t = parse_smart_cookie(c)
-                    if not nid_t: return None
+                    if not nid_t:
+                        with dead_lock_gc: dead_ids_gc.append(row.get('id'))
+                        return None
                     v, _ = _check_netflix_session(nid_t)
-                    return nid_t if v else None
-                with concurrent.futures.ThreadPoolExecutor(max_workers=15) as _pool:
+                    if not v:
+                        with dead_lock_gc: dead_ids_gc.append(row.get('id'))
+                        return None
+                    return nid_t
+                with concurrent.futures.ThreadPoolExecutor(max_workers=20) as _pool:
                     for _nid in _pool.map(_vc, rows[:30]):
                         if _nid:
                             valid_nid = _nid
                             break
+                # Background-delete dead rows
+                if dead_ids_gc:
+                    def _purge_dead_gc(ids=list(dead_ids_gc)):
+                        for _id in ids:
+                            try: supabase.table('netflix').delete().eq('id', _id).execute()
+                            except: pass
+                    GLOBAL_EXECUTOR.submit(_purge_dead_gc)
                 # Get fresh x_l3 TV link from NFToken API for the chosen nid
                 if valid_nid:
                     try:
@@ -2171,6 +2188,16 @@ def main():
                                 print(f"[TV-GC] x_l3 obtained")
                     except Exception as _te:
                         print(f"[TV-GC] API err: {_te}")
+                    # Fallback to iOS-generated TV link (no rate limit)
+                    if not valid_link3:
+                        try:
+                            ios_tok, _ = gen_ios_nftoken(valid_nid)
+                            if ios_tok:
+                                _, _, _l3ios = ios_nftoken_links(ios_tok)
+                                if _l3ios:
+                                    valid_link3 = _l3ios
+                        except Exception:
+                            pass
 
             if not valid_nid:
                 bot.edit_message_text("❌ No valid cookie available. Admin needs to add one.", message.chat.id, status_msg.message_id)
@@ -2611,6 +2638,100 @@ def main():
                 )
 
         GLOBAL_EXECUTOR.submit(_process)
+
+    # ─── Admin: Manage DB (view / deactivate cookies) ──────────────────────
+    @bot.message_handler(func=lambda m: m.text == "🩺 DB Health")
+    def db_health_check(message):
+        if not is_admin(message.chat.id): return
+        if not supabase:
+            return bot.reply_to(message, "❌ Database not configured.", parse_mode='Markdown')
+        status = bot.reply_to(message, "🩺 **Scanning entire DB...**\nThis may take a few minutes for large DBs.", parse_mode='Markdown')
+        cid = message.chat.id
+        sid = status.message_id
+
+        def _run_health():
+            try:
+                total_rows = supabase.table('netflix').select("id", count="exact").execute()
+                total_cnt = total_rows.count or 0
+            except Exception as e:
+                bot.edit_message_text(f"❌ DB error: `{e}`", cid, sid, parse_mode='Markdown')
+                return
+            if total_cnt == 0:
+                bot.edit_message_text("ℹ️ **DB is empty — nothing to scan.**", cid, sid, parse_mode='Markdown')
+                return
+
+            PAGE = 500
+            checked = 0
+            dead = 0
+            alive = 0
+            errors = 0
+            lock_h = threading.Lock()
+            offset = 0
+
+            def _one(row):
+                nonlocal dead, alive, errors, checked
+                rid = row.get('id')
+                c = _db_row_cookie(row)
+                if not c:
+                    try: supabase.table('netflix').delete().eq('id', rid).execute()
+                    except: pass
+                    with lock_h: dead += 1; checked += 1
+                    return
+                nid_x = parse_smart_cookie(c)
+                if not nid_x:
+                    try: supabase.table('netflix').delete().eq('id', rid).execute()
+                    except: pass
+                    with lock_h: dead += 1; checked += 1
+                    return
+                try:
+                    v, _ = _check_netflix_session(nid_x)
+                except Exception:
+                    with lock_h: errors += 1; checked += 1
+                    return
+                if v:
+                    with lock_h: alive += 1; checked += 1
+                else:
+                    try: supabase.table('netflix').delete().eq('id', rid).execute()
+                    except: pass
+                    with lock_h: dead += 1; checked += 1
+
+            last_update = 0.0
+            while offset < total_cnt:
+                try:
+                    page_res = supabase.table('netflix').select("id, data").range(offset, offset + PAGE - 1).execute()
+                except Exception:
+                    offset += PAGE
+                    continue
+                rows = list(page_res.data or [])
+                if not rows:
+                    break
+                with concurrent.futures.ThreadPoolExecutor(max_workers=40) as pool:
+                    futures = [pool.submit(_one, r) for r in rows]
+                    for _ in concurrent.futures.as_completed(futures):
+                        if time.time() - last_update > 2.0:
+                            try:
+                                bot.edit_message_text(
+                                    f"🩺 **DB Health Scan...**\n\n"
+                                    f"`[{checked}/{total_cnt}]` checked\n"
+                                    f"✅ Alive: {alive}  ❌ Dead (deleted): {dead}  ⚠️ Err: {errors}",
+                                    cid, sid, parse_mode='Markdown')
+                                last_update = time.time()
+                            except: pass
+                offset += PAGE
+
+            try:
+                bot.edit_message_text(
+                    f"🩺 **DB Health Scan Complete**\n\n"
+                    f"📊 Total scanned: `{checked}`\n"
+                    f"✅ Alive (kept): `{alive}`\n"
+                    f"❌ Dead (auto-deleted): `{dead}`\n"
+                    f"⚠️ Errors: `{errors}`\n\n"
+                    f"DB is now clean. 🧹",
+                    cid, sid, parse_mode='Markdown'
+                )
+            except: pass
+
+        GLOBAL_EXECUTOR.submit(_run_health)
 
     # ─── Admin: Manage DB (view / deactivate cookies) ──────────────────────
     @bot.message_handler(func=lambda m: m.text == "🗑 Manage DB")
@@ -3188,17 +3309,46 @@ def main():
                 valid_nid_raw = None
                 rows = list(db_res.data)
                 random.shuffle(rows)
-                # Parallel validity check — find first valid quickly
+                dead_ids_tv = []
+                dead_lock_tv = threading.Lock()
+
+                # Quick parallel validity scan (no deep scrape) — finds valid fast + tracks dead
                 def _v_check(row):
                     c = _db_row_cookie(row)
-                    if not c: return None
-                    chk = check_cookie_script(c)
-                    return (chk, c) if chk.get('valid') else None
-                with concurrent.futures.ThreadPoolExecutor(max_workers=20) as _pool:
-                    for _r in _pool.map(_v_check, rows[:40]):
+                    if not c:
+                        with dead_lock_tv: dead_ids_tv.append(row.get('id'))
+                        return None
+                    nid_q = parse_smart_cookie(c)
+                    if not nid_q:
+                        with dead_lock_tv: dead_ids_tv.append(row.get('id'))
+                        return None
+                    v, _ = _check_netflix_session(nid_q)
+                    if not v:
+                        with dead_lock_tv: dead_ids_tv.append(row.get('id'))
+                        return None
+                    return c
+                with concurrent.futures.ThreadPoolExecutor(max_workers=30) as _pool:
+                    for _r in _pool.map(_v_check, rows[:50]):
                         if _r:
-                            valid_acc, valid_nid_raw = _r
+                            valid_nid_raw = _r
                             break
+
+                # Background-delete dead rows
+                if dead_ids_tv:
+                    def _purge_dead_tv(ids=list(dead_ids_tv)):
+                        for _id in ids:
+                            try: supabase.table('netflix').delete().eq('id', _id).execute()
+                            except: pass
+                    GLOBAL_EXECUTOR.submit(_purge_dead_tv)
+
+                # Full cookie check (gets x_l3 TV link + plan/email)
+                if valid_nid_raw:
+                    try:
+                        valid_acc = check_cookie_fast(valid_nid_raw)
+                        if not valid_acc.get("valid"):
+                            valid_acc = check_cookie_script(valid_nid_raw)
+                    except Exception:
+                        valid_acc = check_cookie_script(valid_nid_raw)
 
                 if not valid_acc:
                     markup = types.InlineKeyboardMarkup()
@@ -3653,7 +3803,8 @@ def main():
 
         def _do_generate(cid=chat_id, sid=smsg_id):
             try:
-                res = supabase.table('netflix').select("*").limit(100).execute()
+                # Fetch a small batch first (fast). We'll scan in parallel and auto-delete dead rows.
+                res = supabase.table('netflix').select("*").limit(50).execute()
             except Exception as e:
                 bot.edit_message_text(f"❌ **Database Error.**\n`{e}`", cid, sid, parse_mode='Markdown')
                 return
@@ -3672,24 +3823,58 @@ def main():
             valid_row_id = None
             valid_nid = None
             # Fast-validate cookies without Playwright (1-2s each instead of 10-15s).
-            # Once a valid cookie is found, take a screenshot separately.
+            # Auto-delete dead cookies from DB in parallel so pool stays clean.
             rows = list(res.data or [])
             random.shuffle(rows)
-            # Parallel validity scan — 20 threads, ~1s to scan 40 cookies
+            dead_ids = []
+            dead_lock = threading.Lock()
+
             def _find_valid(row):
                 c = _db_row_cookie(row)
-                if not c: return None
-                chk = check_cookie_script(c)
-                return (chk, c, row.get('id')) if chk.get('valid') else None
-            with concurrent.futures.ThreadPoolExecutor(max_workers=20) as _pool:
-                for _r in _pool.map(_find_valid, rows[:40]):
-                    if _r:
-                        valid_acc, valid_cookie, valid_row_id = _r
-                        valid_nid = parse_smart_cookie(valid_cookie)
+                if not c: 
+                    with dead_lock:
+                        dead_ids.append(row.get('id'))
+                    return None
+                nid_t = parse_smart_cookie(c)
+                if not nid_t:
+                    with dead_lock:
+                        dead_ids.append(row.get('id'))
+                    return None
+                # Quick validity check first (~0.5s) — skip deep scrape until we find a winner
+                valid_q, _ = _check_netflix_session(nid_t)
+                if not valid_q:
+                    with dead_lock:
+                        dead_ids.append(row.get('id'))
+                    return None
+                return (c, row.get('id'), nid_t)
+
+            # Parallel validity scan — 30 threads, finishes scan of 50 cookies in ~2s
+            with concurrent.futures.ThreadPoolExecutor(max_workers=30) as _pool:
+                for _r in _pool.map(_find_valid, rows[:50]):
+                    if _r and not valid_cookie:
+                        valid_cookie, valid_row_id, valid_nid = _r
+                        # Remove the winner row so next user doesn't get the same account
                         if valid_row_id:
                             try: supabase.table('netflix').delete().eq('id', valid_row_id).execute()
                             except: pass
                         break
+
+            # Background-delete dead rows so DB stays clean (non-blocking)
+            if dead_ids:
+                def _purge_dead(ids=list(dead_ids)):
+                    for _id in ids:
+                        try: supabase.table('netflix').delete().eq('id', _id).execute()
+                        except: pass
+                GLOBAL_EXECUTOR.submit(_purge_dead)
+
+            # Now do a FULL check (with API links xl1/xl2/xl3) for the winner
+            if valid_cookie:
+                try:
+                    valid_acc = check_cookie_fast(valid_cookie)
+                    if not valid_acc.get("valid"):
+                        valid_acc = check_cookie_script(valid_cookie)  # final fallback
+                except Exception:
+                    valid_acc = check_cookie_script(valid_cookie)
 
             if valid_acc:
                 # Take screenshot for the valid cookie (best-effort, reduced timeouts)
@@ -3786,7 +3971,7 @@ def main():
         mode = user_modes.get(uid)
 
         # Ignore buttons/commands
-        if message.text and (message.text.startswith("/") or message.text in ["📩 Send Here (DM)", "📡 Send to Channel", "🛑 Stop System", "📺 TV Login", "🎁 Generate Netflix", "🔍 Free Check", "💎 Premium Check", "📣 Broadcast", "👥 Users Stats", "➕ Add Cookie", "👑 Manage Access", "🗑 Manage DB"]): return
+        if message.text and (message.text.startswith("/") or message.text in ["📩 Send Here (DM)", "📡 Send to Channel", "🛑 Stop System", "📺 TV Login", "🎁 Generate Netflix", "🔍 Free Check", "💎 Premium Check", "📣 Broadcast", "👥 Users Stats", "➕ Add Cookie", "👑 Manage Access", "🗑 Manage DB", "🩺 DB Health"]): return
 
         # Auto-check: if no mode set but user sent a cookie-looking text/file,
         # route to Free Check automatically
